@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(file \"/c/Users/imtie/downloads/ray tracing\"/*)",
+      "Bash(pip list:*)",
+      "Bash(wc -l \"/c/Users/imtie/downloads/ray tracing\"/*.py)",
+      "Bash(xargs ls:*)",
+      "Bash(python -c \"import render; print\\('OK'\\)\")",
+      "Bash(python -c \"import ast, sys; ast.parse\\(open\\('render.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('render.py', encoding='utf-8'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('render_working.py', encoding='utf-8'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")"
+    ]
+  }
+}
