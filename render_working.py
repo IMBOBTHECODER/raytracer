@@ -17,7 +17,7 @@ if __name__ == "__main__":
     scene.add_object(mesh.Mesh(
         "models/bugatti.obj",
         colour=np.array([0.192, 0.549, 0.906]),
-        material="metal",
+        material=None,
         scale=0.1,
         translate=np.array([0.0, -0.55, -2.0]),  # y: -1 - (-4.5*0.1) = -0.55 sits on floor
     ))
