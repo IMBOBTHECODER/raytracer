@@ -1,24 +1,75 @@
-from functions import normalize, lerp
 from config import Config
-from mesh import _aabb_hit
-import cv2
 import numpy as np
-import multiprocessing as mp
-import threading
-from numba import njit
-import time
+import cv2
+import taichi as ti
+import taichi.math as tm
 
+ti.init(arch=ti.cpu)
 
-@njit(cache=True)
-def background(direction: np.ndarray) -> np.ndarray:
-    unit_direction = normalize(direction)
+tri_v0              = None
+tri_v1              = None
+tri_v2              = None
+tri_colour          = None
+tri_material        = None
+tri_metal_fuzz      = None
+tri_refraction_index= None
+tri_emission        = None
+tri_normal          = None
+tri_n0              = None
+tri_n1              = None
+tri_n2              = None
+tri_has_smooth      = None
+
+# BVH node fields (populated by build())
+bvh_bbox_min  = None  # vec3 per node — AABB min corner
+bvh_bbox_max  = None  # vec3 per node — AABB max corner
+bvh_left      = None  # int per node  — left child index (-1 if leaf)
+bvh_right     = None  # int per node  — right child index (-1 if leaf)
+bvh_tri_start = None  # int per node  — first index into bvh_tri_indices (leaf only)
+bvh_tri_end   = None  # int per node  — one-past-last index into bvh_tri_indices (leaf only)
+bvh_tri_indices = None  # flat list: maps node's [tri_start..tri_end) → triangle index
+
+BVH_STACK_SIZE = 64   # max tree depth * 2; increase if your BVH is very deep
+
+# Plane fields (populated by build())
+plane_point    = None
+plane_normal   = None
+plane_colour   = None
+plane_material = None
+plane_metal_fuzz       = None
+plane_refraction_index = None
+plane_emission         = None
+n_planes = 0
+
+# Sphere fields (populated by build())
+sphere_center  = None
+sphere_radius  = None
+sphere_colour  = None
+sphere_material = None
+sphere_metal_fuzz       = None
+sphere_refraction_index = None
+sphere_emission         = None
+n_spheres = 0
+
+framebuffer = ti.Vector.field(3, dtype=ti.f32, shape=(Config.img_height, Config.img_width))
+
+@ti.func
+def lerp(a, b, t):
+    # Blend between a and b
+    return a + t * (b - a)
+
+@ti.func
+def normalize(v):
+    n = v.norm()
+    return v / (n if n > 1e-8 else 1.0)
+
+@ti.func
+def background(direction):
+    unit_direction = direction.normalized()
     t = 0.5 * (unit_direction[1] + 1.0)
-    return lerp(np.array([0.9, 0.9, 0.9]), np.array([1, 0.945, 0.827]), t)
-
-def tone_map(hdr):
-    # Filmic (ACES approximation) — compresses highlights without clipping
-    a, b, c, d, e = 2.51, 0.03, 2.43, 0.59, 0.14
-    return np.clip((hdr * (a * hdr + b)) / (hdr * (c * hdr + d) + e), 0, 1)
+    white = tm.vec3(0.9, 0.9, 0.9)
+    warm  = tm.vec3(1.0, 0.945, 0.827)
+    return (1.0 - t) * white + t * warm
 
 
 def apply_effect(linear: np.ndarray):
@@ -37,176 +88,642 @@ def apply_effect(linear: np.ndarray):
     out = (np.clip(bloomed, 0, 1) * 255).astype(np.uint8)
     return out
 
+@ti.func
+def aabb_hit(node_idx, ray_o, ray_d, t_min, t_max):
+    """Slab test — returns True if ray hits the AABB of this node."""
+    for axis in ti.static(range(3)):
+        inv_d = 1.0 / ray_d[axis] if ti.abs(ray_d[axis]) > 1e-10 else 1e30
+        t0 = (bvh_bbox_min[node_idx][axis] - ray_o[axis]) * inv_d
+        t1 = (bvh_bbox_max[node_idx][axis] - ray_o[axis]) * inv_d
+        if inv_d < 0:
+            t0, t1 = t1, t0
+        t_min = tm.max(t_min, t0)
+        t_max = tm.min(t_max, t1)
+    return t_max > t_min  # check once after all 3 axes
 
-# ────────────────────────────────────────────────────────────────────────────
+@ti.func
+def tri_intersect(tri_idx, ray_o, ray_d, t_min, t_max):
+    """Möller-Trumbore intersection. Returns (t, u, v) — t < 0 means no hit."""
+    v0 = tri_v0[tri_idx]
+    edge1 = tri_v1[tri_idx] - v0
+    edge2 = tri_v2[tri_idx] - v0
 
-def ray_colour(t_min, t_max, ray_o, ray_d, world, depth=0):
-    if depth >= Config.depth_limit:
-        return np.array([0.0, 0.0, 0.0], dtype=np.float64)  # black for rays that exceed depth limit
+    h = tm.cross(ray_d, edge2)
+    a = tm.dot(edge1, h)
 
-    t, obj = world.hit(ray_o, ray_d, t_min, t_max)
-    if obj is None:
-        return background(ray_d)  # background colour if ray hits nothing
+    t, u, v = -1.0, 0.0, 0.0
+    if ti.abs(a) > 1e-8:          # not parallel
+        f = 1.0 / a
+        s = ray_o - v0
+        u = f * tm.dot(s, h)
+        if u >= 0.0 and u <= 1.0:
+            q = tm.cross(s, edge1)
+            v = f * tm.dot(ray_d, q)
+            if v >= 0.0 and u + v <= 1.0:
+                t_hit = f * tm.dot(edge2, q)
+                if t_min <= t_hit <= t_max:
+                    t = t_hit
+    return t, u, v
 
-    hit_point = ray_o + t * ray_d
-    normal = obj.get_normal(ray_d, t)
+@ti.func
+def bvh_hit(ray_o, ray_d, t_min, t_max):
+    """Iterative stack-based BVH traversal. Returns (t, tri_idx, u, v)."""
+    best_t   = -1.0
+    best_idx = -1
+    best_u   = 0.0
+    best_v   = 0.0
 
-    scatter_direction = obj.reflect(ray_d, normal)
+    # Fixed-size stack — stores node indices to visit
+    stack     = ti.Vector([0] * BVH_STACK_SIZE, dt=ti.i32)
+    stack_ptr = 0
+    stack[stack_ptr] = 0  # start at root (node 0)
+    stack_ptr += 1
 
-    if scatter_direction is None:
-        return obj.object_colour(hit_point)  # emissive or absorbing both return here
+    while stack_ptr > 0:
+        stack_ptr -= 1
+        node_idx = stack[stack_ptr]
 
-    scattered_d = normalize(scatter_direction)
+        far = best_t if best_t > 0 else t_max
+        if not aabb_hit(node_idx, ray_o, ray_d, t_min, far):
+            continue
 
-    return obj.object_colour(hit_point) * obj.colour_multiplier * ray_colour(t_min, t_max, hit_point, scattered_d, world, depth + 1)
+        if bvh_left[node_idx] == -1:  # leaf node
+            for k in range(bvh_tri_start[node_idx], bvh_tri_end[node_idx]):
+                tri_idx = bvh_tri_indices[k]
+                t, u, v = tri_intersect(tri_idx, ray_o, ray_d, t_min, far)
+                if t > 0 and (best_t < 0 or t < best_t):
+                    best_t   = t
+                    best_idx = tri_idx
+                    best_u   = u
+                    best_v   = v
+                    far = best_t  # tighten bound
+        else:
+            # push both children — right first so left is processed first
+            stack[stack_ptr] = bvh_right[node_idx]
+            stack_ptr += 1
+            stack[stack_ptr] = bvh_left[node_idx]
+            stack_ptr += 1
+
+    return best_t, best_idx, best_u, best_v
+
+@ti.func
+def get_normal(tri_idx, ray_d, u, v):
+    n = tm.vec3(0.0)
+    if tri_has_smooth[tri_idx]:
+        n = (1.0 - u - v) * tri_n0[tri_idx] + u * tri_n1[tri_idx] + v * tri_n2[tri_idx]
+        n = normalize(n)
+    else:
+        n = tri_normal[tri_idx]
+    # flip if ray hits the back face
+    if tm.dot(ray_d, n) > 0:
+        n = -n
+    return n
+
+@ti.func
+def get_colour(tri_idx):
+    result = tm.vec3(0.0)
+    if tri_material[tri_idx] == 3:  # emissive
+        result = tri_colour[tri_idx] * tri_emission[tri_idx]
+    return result
+
+@ti.func
+def random_unit_vec():
+    # Random point on unit sphere via rejection — keep sampling until inside unit sphere
+    v = tm.vec3(0.0)
+    while True:
+        v = tm.vec3(ti.random() * 2 - 1, ti.random() * 2 - 1, ti.random() * 2 - 1)
+        if v.norm_sqr() <= 1.0:
+            break
+    return normalize(v)
+
+@ti.func
+def scatter(colour, material, metal_fuzz, refraction_index, ray_d, normal):
+    """Material BRDF — takes raw material values, works for any object type."""
+    scatter_dir = tm.vec3(0.0)
+    attenuation = colour
+    did_scatter = False
+
+    if material == 1:  # Metal
+        d = normalize(ray_d)
+        reflected = d - 2 * tm.dot(d, normal) * normal
+        reflected += metal_fuzz * random_unit_vec()
+        did_scatter = tm.dot(reflected, normal) > 0
+        scatter_dir = reflected
+
+    elif material == 3 or material == 4:  # Emissive / Absorbing — ray terminates
+        did_scatter = False
+
+    elif material == 2:  # Glass
+        d = ray_d
+        front_face = tm.dot(d, normal) < 0
+        n = normal if front_face else -normal
+        eta = 1.0 / refraction_index if front_face else refraction_index
+        cos_theta = tm.min(tm.dot(-d, n), 1.0)
+        sin_theta = tm.sqrt(tm.max(0.0, 1.0 - cos_theta ** 2))
+        r0 = ((1 - eta) / (1 + eta)) ** 2
+        reflectance = r0 + (1 - r0) * (1 - cos_theta) ** 5
+        if eta * sin_theta > 1.0 or ti.random() < reflectance:
+            scatter_dir = d - 2 * tm.dot(d, n) * n
+        else:
+            d_perp     = eta * (d + cos_theta * n)
+            d_parallel = -tm.sqrt(ti.abs(1.0 - d_perp.norm_sqr())) * n
+            scatter_dir = d_perp + d_parallel
+        attenuation = tm.vec3(1.0)  # glass doesn't tint
+        did_scatter = True
+
+    else:  # Diffuse (material == 0)
+        rand_vec = random_unit_vec()
+        if tm.dot(rand_vec, normal) < 0:
+            rand_vec = -rand_vec
+        scatter_direction = normal + rand_vec
+        if scatter_direction.norm() < 1e-8:
+            scatter_direction = normal
+        scatter_dir = scatter_direction
+        did_scatter = True
+
+    return scatter_dir, attenuation, did_scatter
 
 
-def render_worker(j_start, i_start, antialising_samples, pixel00_loc, pixel_delta_u, pixel_delta_v, camera_center, u, v):
-    framebuffer = np.frombuffer(shared_array.get_obj()).reshape((Config.img_height, Config.img_width, 3))
-    world = shared_world
+@ti.func
+def plane_hit(plane_idx, ray_o, ray_d, t_min, t_max):
+    """Ray-plane intersection. Returns t, or -1 on miss."""
+    n = plane_normal[plane_idx]
+    denom = tm.dot(ray_d, n)
+    t = -1.0
+    if ti.abs(denom) > 1e-6:
+        t_hit = tm.dot(plane_point[plane_idx] - ray_o, n) / denom
+        if t_min <= t_hit and t_hit <= t_max:
+            t = t_hit
+    return t
 
-    j_end = min(j_start + Config.tile_size, Config.img_height)
-    i_end = min(i_start + Config.tile_size, Config.img_width)
 
-    # Stratified sampling: if spp is a perfect square (4, 16, 64 ...),
-    # divide each pixel into a sqrt_spp × sqrt_spp grid and place one sample
-    # per cell with random jitter. Guarantees coverage, reduces clumping.
-    sqrt_spp = int(np.sqrt(antialising_samples))
-    use_stratified = sqrt_spp * sqrt_spp == antialising_samples
-    if use_stratified:
-        # Stratum row/col indices — same for every pixel, computed once
-        grid_c = np.arange(antialising_samples) % sqrt_spp   # column: 0..sqrt_spp-1
-        grid_r = np.arange(antialising_samples) // sqrt_spp  # row:    0..sqrt_spp-1
+@ti.func
+def sphere_hit(sphere_idx, ray_o, ray_d, t_min, t_max):
+    """Ray-sphere intersection. Returns t, or -1 on miss."""
+    oc = ray_o - sphere_center[sphere_idx]
+    a  = tm.dot(ray_d, ray_d)
+    b  = 2.0 * tm.dot(oc, ray_d)
+    c  = tm.dot(oc, oc) - sphere_radius[sphere_idx] ** 2
+    disc = b * b - 4 * a * c
+    t = -1.0
+    if disc >= 0:
+        sqrt_d = tm.sqrt(disc)
+        t1 = (-b - sqrt_d) / (2 * a)
+        t2 = (-b + sqrt_d) / (2 * a)
+        if t_min <= t1 and t1 <= t_max:
+            t = t1
+        elif t_min <= t2 and t2 <= t_max:
+            t = t2
+    return t
 
-    # Aperture disk randoms — still fully random (not stratified)
-    total = (j_end - j_start) * (i_end - i_start) * antialising_samples
-    rng_angle  = np.random.uniform(0, 2 * np.pi, size=total)
-    rng_radius = np.random.uniform(0, 1, size=total)
-    idx = 0
 
-    for j in range(j_start, j_end):
-        for i in range(i_start, i_end):
-            if use_stratified:
-                # One jitter per stratum cell, scaled to [-0.5, 0.5] within the pixel
-                jitter_u = np.random.uniform(0, 1, antialising_samples)
-                jitter_v = np.random.uniform(0, 1, antialising_samples)
-                sample_du = (grid_c + jitter_u) / sqrt_spp - 0.5
-                sample_dv = (grid_r + jitter_v) / sqrt_spp - 0.5
+@ti.func
+def scene_hit(ray_o, ray_d, t_min, t_max):
+    """Check all objects. Returns (t, hit_type, obj_idx, u, v).
+    hit_type: -1=miss, 0=triangle, 1=plane, 2=sphere."""
+    best_t    = -1.0
+    best_type = -1
+    best_idx  = -1
+    best_u    = 0.0
+    best_v    = 0.0
+
+    # Triangles via BVH
+    t, tri_idx, u, v = bvh_hit(ray_o, ray_d, t_min, t_max)
+    if t > 0:
+        best_t = t;  best_type = 0;  best_idx = tri_idx
+        best_u = u;  best_v = v
+
+    # Planes
+    for i in range(n_planes):
+        far = best_t if best_t > 0 else t_max
+        t = plane_hit(i, ray_o, ray_d, t_min, far)
+        if t > 0 and (best_t < 0 or t < best_t):
+            best_t = t;  best_type = 1;  best_idx = i
+
+    # Spheres
+    for i in range(n_spheres):
+        far = best_t if best_t > 0 else t_max
+        t = sphere_hit(i, ray_o, ray_d, t_min, far)
+        if t > 0 and (best_t < 0 or t < best_t):
+            best_t = t;  best_type = 2;  best_idx = i
+
+    return best_t, best_type, best_idx, best_u, best_v
+
+
+@ti.func
+def ray_colour(ray_o, ray_d):
+    colour     = tm.vec3(0.0)
+    throughput = tm.vec3(1.0)
+
+    for depth in range(Config.depth_limit):
+        t, hit_type, obj_idx, u, v = scene_hit(ray_o, ray_d, 0.001, 1e30)
+
+        if hit_type == -1:
+            colour += throughput * background(ray_d)
+            break
+
+        hit_point = ray_o + t * ray_d
+
+        # ── Normal ───────────────────────────────────────────────────────────
+        normal = tm.vec3(0.0)
+        if hit_type == 0:  # triangle
+            normal = get_normal(obj_idx, ray_d, u, v)
+        elif hit_type == 1:  # plane
+            normal = plane_normal[obj_idx]
+            if tm.dot(ray_d, normal) > 0:
+                normal = -normal
+        else:  # sphere
+            normal = normalize(hit_point - sphere_center[obj_idx])
+            if tm.dot(ray_d, normal) > 0:
+                normal = -normal
+
+        # ── Material lookup ──────────────────────────────────────────────────
+        mat_colour = tm.vec3(0.0)
+        mat_type   = 0
+        mat_fuzz   = 0.0
+        mat_ior    = 1.5
+        mat_emit   = 0.0
+
+        if hit_type == 0:  # triangle
+            # checkerboard for plane is not applicable — plain colour
+            mat_colour = tri_colour[obj_idx]
+            mat_type   = tri_material[obj_idx]
+            mat_fuzz   = tri_metal_fuzz[obj_idx]
+            mat_ior    = tri_refraction_index[obj_idx]
+            mat_emit   = tri_emission[obj_idx]
+        elif hit_type == 1:  # plane — checkerboard diffuse
+            cx = int(hit_point[0]) if hit_point[0] >= 0 else int(hit_point[0]) - 1
+            cz = int(hit_point[2]) if hit_point[2] >= 0 else int(hit_point[2]) - 1
+            if (cx + cz) % 2 == 0:
+                mat_colour = tm.vec3(0.8, 0.8, 0.8)
             else:
-                sample_du = np.random.uniform(-0.5, 0.5, antialising_samples)
-                sample_dv = np.random.uniform(-0.5, 0.5, antialising_samples)
+                mat_colour = tm.vec3(0.1, 0.1, 0.1)
+            mat_type = plane_material[obj_idx]
+            mat_fuzz = plane_metal_fuzz[obj_idx]
+            mat_ior  = plane_refraction_index[obj_idx]
+            mat_emit = plane_emission[obj_idx]
+        else:  # sphere
+            mat_colour = sphere_colour[obj_idx]
+            mat_type   = sphere_material[obj_idx]
+            mat_fuzz   = sphere_metal_fuzz[obj_idx]
+            mat_ior    = sphere_refraction_index[obj_idx]
+            mat_emit   = sphere_emission[obj_idx]
 
-            for s in range(antialising_samples):
-                du = i + sample_du[s]
-                dv = j + sample_dv[s]
+        # ── Scatter ──────────────────────────────────────────────────────────
+        scatter_dir, attenuation, did_scatter = scatter(
+            mat_colour, mat_type, mat_fuzz, mat_ior, ray_d, normal
+        )
 
-                # find the 3D center of this pixel on the viewport
-                pixel_center = pixel00_loc + du * pixel_delta_u + dv * pixel_delta_v
+        if not did_scatter:
+            # emissive: add light; absorbing: add black
+            colour += throughput * mat_colour * mat_emit
+            break
 
-                angle  = rng_angle[idx]
-                radius = np.sqrt(rng_radius[idx])
-                idx += 1
+        throughput *= attenuation
+        ray_o = hit_point
+        ray_d = normalize(scatter_dir)
 
-                offset = Config.aperture * radius * (np.cos(angle) * u + np.sin(angle) * v)  # random point in aperture disk
+    return colour
 
-                ray_o = camera_center + offset
 
-                # the ray direction is from the camera toward that pixel's 3D position
-                # this is what makes each pixel look in a slightly different direction
-                pixel_direction = normalize(pixel_center - camera_center)
-                focal_point = camera_center + Config.focus_dist * pixel_direction  # fixed point in space
-                ray_d = normalize(focal_point - ray_o)  # ray from lens point to focal point
+@ti.kernel
+def render():
+    img_height = Config.img_height
+    img_width  = Config.img_width
+    viewport_height = Config.viewport_height
+    viewport_width = Config.viewport_width
+    aperture   = Config.aperture
+    focus_dist = Config.focus_dist
+    antialising_samples = Config.antialising_samples
+    camera_center = tm.vec3(Config.camera_center)
 
-                colour = ray_colour(0.008, float('inf'), ray_o, ray_d, world, depth=0)
-
-                framebuffer[j, i] += colour  # accumulate the colour for anti-aliasing
-
-            framebuffer[j, i] /= antialising_samples  # average the samples for anti-aliasing
-
-def render_core(world=None, shared=None):
     # forward axis — direction the camera looks
-    w = normalize(Config.lookfrom - Config.lookat)
+    w = normalize(tm.vec3(Config.lookfrom - Config.lookat))
 
     # right axis — perpendicular to forward and up
-    u = normalize(np.cross(Config.vup, w))
+    u = normalize(tm.cross(tm.vec3(Config.vup), w))
 
     # up axis — perpendicular to both (true up relative to camera)
-    v = np.cross(w, u)
+    v = tm.cross(w, u)
 
     # how much to step in 3D space to move one pixel
-    pixel_delta_u = u * (Config.viewport_width / Config.img_width)     # right
-    pixel_delta_v = -v * (Config.viewport_height / Config.img_height)  # down
+    pixel_delta_u = u * (viewport_width / img_width)     # right
+    pixel_delta_v = -v * (viewport_height / img_height)  # down
 
     # find the 3D position of the top-left corner of the viewport
     # start at camera, go forward (focal_length in -Z), then go left and up by half the viewport
     viewport_upper_left = (
-        Config.camera_center
+        camera_center
         - Config.focal_length * w
-        - (Config.viewport_width / 2) * u
-        + (Config.viewport_height / 2) * v
+        - (viewport_width / 2) * u
+        + (viewport_height / 2) * v
     )
 
     # pixel00_loc is the center of the top-left pixel (not the corner of the viewport)
     # we offset by half a pixel in both directions to center within the pixel
     pixel00_loc = viewport_upper_left + 0.5 * (pixel_delta_u + pixel_delta_v)
 
-    tiles = [
-        (j, i, Config.antialising_samples, pixel00_loc, pixel_delta_u, pixel_delta_v, Config.camera_center, u, v)
-        for j in range(0, Config.img_height, Config.tile_size)
-        for i in range(0, Config.img_width, Config.tile_size)
-    ]
-    print(f"[Render] Spawning {min(Config.num_workers, len(tiles))} workers for {len(tiles)} tiles ({Config.img_width}x{Config.img_height}, {Config.antialising_samples} spp)...")
-    with mp.Pool(processes=min(Config.num_workers, len(tiles)), initializer=init_worker, initargs=(world, shared)) as pool:
-        pool.starmap(render_worker, tiles, chunksize=Config.starmap_chunksize)
-    print(f"[Render] All tiles done.")
+    sqrt_spp = int(tm.sqrt(antialising_samples))
+    use_stratified = sqrt_spp * sqrt_spp == antialising_samples
+
+    for j, i in ti.ndrange(img_height, img_width):
+        for s in range(antialising_samples):
+            sample_du = 0.0
+            sample_dv = 0.0
+            if use_stratified:
+                grid_c = s % sqrt_spp
+                grid_r = s // sqrt_spp
+                sample_du = (grid_c + ti.random()) / sqrt_spp - 0.5
+                sample_dv = (grid_r + ti.random()) / sqrt_spp - 0.5
+            else:
+                sample_du = ti.random() - 0.5
+                sample_dv = ti.random() - 0.5
+
+            du = i + sample_du
+            dv = j + sample_dv
+
+            # find the 3D center of this pixel on the viewport
+            pixel_center = pixel00_loc + du * pixel_delta_u + dv * pixel_delta_v
+
+            angle  = ti.random() * 2.0 * tm.pi
+            radius = tm.sqrt(ti.random())
+
+            offset = aperture * radius * (tm.cos(angle) * u + tm.sin(angle) * v)  # random point in aperture disk
+
+            ray_o = camera_center + offset
+
+            # the ray direction is from the camera toward that pixel's 3D position
+            # this is what makes each pixel look in a slightly different direction
+            pixel_direction = normalize(pixel_center - camera_center)
+            focal_point = camera_center + focus_dist * pixel_direction  # fixed point in space
+            ray_d = normalize(focal_point - ray_o)  # ray from lens point to focal point
+
+            colour = ray_colour(ray_o, ray_d)
+
+            framebuffer[j, i] += colour  # accumulate the colour for anti-aliasing
+
+        framebuffer[j, i] /= antialising_samples  # average the samples for anti-aliasing
+
+def gather_triangles(scene):
+    """Walk the scene and collect all Triangle objects into a flat list."""
+    tris = []
+    stack = []
+    for obj in scene.objects:
+        if hasattr(obj, 'bvh'):
+            stack.append(obj.bvh)
+    while stack:
+        node = stack.pop()
+        if node.is_leaf:
+            tris.extend(node.triangles)
+        elif node.children is not None:
+            stack.extend(node.children)
+        else:
+            stack.append(node.left)
+            stack.append(node.right)
+    return tris
 
 
-shared_world = None
-shared_array = None
+def _build_flat_bvh(v0_arr, v1_arr, v2_arr, leaf_size=8):
+    """
+    Build a BVH from scratch using flat numpy arrays.
+    Returns arrays ready to upload to GPU:
+      bbox_min, bbox_max : (N, 3) float32
+      left, right        : (N,)   int32   — child node indices, -1 for leaves
+      tri_start, tri_end : (N,)   int32   — range into ordered_indices (leaves only)
+      ordered_indices    : (M,)   int32   — flat triangle index list
+    """
+    records = []   # filled by build(); each entry is a tuple
+    ordered = []   # flat list of triangle indices in leaf order
 
-def render(world):
-    print(f"[Render] Initialising framebuffer ({Config.img_width}x{Config.img_height})...")
-    shared = mp.Array('d', Config.img_height * Config.img_width * 3)
-    framebuffer = np.frombuffer(shared.get_obj()).reshape((Config.img_height, Config.img_width, 3))
+    def build(indices):
+        node_idx = len(records)
+        records.append(None)  # reserve slot, filled after children are known
 
-    # Preview loop runs in a thread so the Pool stays on the main thread (required on Windows)
-    stop_preview = threading.Event()
-    def preview_loop():
-        while not stop_preview.is_set():
-            # Quick gamma preview so you can see progress during render
-            frame = (np.sqrt(np.clip(framebuffer, 0, 1)) * 255).astype(np.uint8)
-            cv2.imwrite(Config.save_path, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-            time.sleep(1)
+        v0 = v0_arr[indices]
+        v1 = v1_arr[indices]
+        v2 = v2_arr[indices]
+        bmin = np.minimum(np.minimum(v0, v1), v2).min(axis=0).astype(np.float32) - 1e-4
+        bmax = np.maximum(np.maximum(v0, v1), v2).max(axis=0).astype(np.float32) + 1e-4
 
-    thread = threading.Thread(target=preview_loop, daemon=True)
-    thread.start()
+        if len(indices) <= leaf_size:
+            # Leaf: store triangle indices in ordered list
+            start = len(ordered)
+            ordered.extend(indices.tolist())
+            records[node_idx] = (bmin, bmax, -1, -1, start, len(ordered))
+            return node_idx
 
+        # Split on longest axis at median centroid
+        centroids = (v0 + v1 + v2) / 3.0
+        axis = int(np.argmax(centroids.max(axis=0) - centroids.min(axis=0)))
+        order = np.argsort(centroids[:, axis])
+        sorted_indices = indices[order]
+        mid = len(sorted_indices) // 2
+
+        left_idx  = build(sorted_indices[:mid])
+        right_idx = build(sorted_indices[mid:])
+        records[node_idx] = (bmin, bmax, left_idx, right_idx, 0, 0)
+        return node_idx
+
+    build(np.arange(len(v0_arr), dtype=np.int32))
+
+    # Convert list of tuples to flat numpy arrays
+    n = len(records)
+    bbox_min_arr  = np.zeros((n, 3), dtype=np.float32)
+    bbox_max_arr  = np.zeros((n, 3), dtype=np.float32)
+    left_arr      = np.full(n, -1, dtype=np.int32)
+    right_arr     = np.full(n, -1, dtype=np.int32)
+    tri_start_arr = np.zeros(n, dtype=np.int32)
+    tri_end_arr   = np.zeros(n, dtype=np.int32)
+
+    for i, (bmin, bmax, l, r, ts, te) in enumerate(records):
+        bbox_min_arr[i]  = bmin
+        bbox_max_arr[i]  = bmax
+        left_arr[i]      = l
+        right_arr[i]     = r
+        tri_start_arr[i] = ts
+        tri_end_arr[i]   = te
+
+    return bbox_min_arr, bbox_max_arr, left_arr, right_arr, tri_start_arr, tri_end_arr, np.array(ordered, dtype=np.int32)
+
+
+def build(scene):
+    global tri_v0, tri_v1, tri_v2, tri_colour, tri_material
+    global tri_metal_fuzz, tri_refraction_index, tri_emission
+    global tri_normal, tri_n0, tri_n1, tri_n2, tri_has_smooth
+    global bvh_bbox_min, bvh_bbox_max, bvh_left, bvh_right
+    global bvh_tri_start, bvh_tri_end, bvh_tri_indices
+    global plane_point, plane_normal, plane_colour, plane_material
+    global plane_metal_fuzz, plane_refraction_index, plane_emission, n_planes
+    global sphere_center, sphere_radius, sphere_colour, sphere_material
+    global sphere_metal_fuzz, sphere_refraction_index, sphere_emission, n_spheres
+
+    all_tris = gather_triangles(scene)
+    n = len(all_tris)
+    print(f"[Build] {n:,} triangles — uploading to GPU...")
+
+    materials = {None: 0, "metal": 1, "glass": 2, "emissive": 3, "absorbing": 4}
+
+    # ── Extract triangle data into numpy arrays first ────────────────────────
+    v0_np  = np.array([t.v0  for t in all_tris], dtype=np.float32)
+    v1_np  = np.array([t.v1  for t in all_tris], dtype=np.float32)
+    v2_np  = np.array([t.v2  for t in all_tris], dtype=np.float32)
+
+    # ── Build flat BVH ───────────────────────────────────────────────────────
+    print(f"[Build] Building BVH...")
+    bmin_np, bmax_np, left_np, right_np, ts_np, te_np, tidx_np = _build_flat_bvh(v0_np, v1_np, v2_np)
+    n_nodes = len(bmin_np)
+    print(f"[Build] BVH: {n_nodes:,} nodes")
+
+    # ── Allocate triangle fields ─────────────────────────────────────────────
+    tri_v0               = ti.Vector.field(3, dtype=ti.f32, shape=n)
+    tri_v1               = ti.Vector.field(3, dtype=ti.f32, shape=n)
+    tri_v2               = ti.Vector.field(3, dtype=ti.f32, shape=n)
+    tri_colour           = ti.Vector.field(3, dtype=ti.f32, shape=n)
+    tri_material         = ti.field(dtype=ti.i32, shape=n)
+    tri_metal_fuzz       = ti.field(dtype=ti.f32, shape=n)
+    tri_refraction_index = ti.field(dtype=ti.f32, shape=n)
+    tri_emission         = ti.field(dtype=ti.f32, shape=n)
+    tri_normal           = ti.Vector.field(3, dtype=ti.f32, shape=n)
+    tri_n0               = ti.Vector.field(3, dtype=ti.f32, shape=n)
+    tri_n1               = ti.Vector.field(3, dtype=ti.f32, shape=n)
+    tri_n2               = ti.Vector.field(3, dtype=ti.f32, shape=n)
+    tri_has_smooth       = ti.field(dtype=ti.i32, shape=n)
+
+    # ── Allocate BVH fields ──────────────────────────────────────────────────
+    bvh_bbox_min    = ti.Vector.field(3, dtype=ti.f32, shape=n_nodes)
+    bvh_bbox_max    = ti.Vector.field(3, dtype=ti.f32, shape=n_nodes)
+    bvh_left        = ti.field(dtype=ti.i32, shape=n_nodes)
+    bvh_right       = ti.field(dtype=ti.i32, shape=n_nodes)
+    bvh_tri_start   = ti.field(dtype=ti.i32, shape=n_nodes)
+    bvh_tri_end     = ti.field(dtype=ti.i32, shape=n_nodes)
+    bvh_tri_indices = ti.field(dtype=ti.i32, shape=len(tidx_np))
+
+    # ── Fill triangle fields (bulk numpy upload) ─────────────────────────────
+    colour_np   = np.array([t.colour.astype(np.float32)   for t in all_tris], dtype=np.float32)
+    material_np = np.array([materials.get(t.material, 0)  for t in all_tris], dtype=np.int32)
+    fuzz_np     = np.array([t.metal_fuzz                  for t in all_tris], dtype=np.float32)
+    ior_np      = np.array([t.refraction_index             for t in all_tris], dtype=np.float32)
+    emission_np = np.array([t.emission_intensity           for t in all_tris], dtype=np.float32)
+    normal_np   = np.array([t._normal.astype(np.float32)  for t in all_tris], dtype=np.float32)
+    smooth_np   = np.array([1 if t.n0 is not None else 0  for t in all_tris], dtype=np.int32)
+    n0_np = np.array([t.n0 if t.n0 is not None else t._normal for t in all_tris], dtype=np.float32)
+    n1_np = np.array([t.n1 if t.n1 is not None else t._normal for t in all_tris], dtype=np.float32)
+    n2_np = np.array([t.n2 if t.n2 is not None else t._normal for t in all_tris], dtype=np.float32)
+
+    tri_v0.from_numpy(v0_np)
+    tri_v1.from_numpy(v1_np)
+    tri_v2.from_numpy(v2_np)
+    tri_colour.from_numpy(colour_np)
+    tri_material.from_numpy(material_np)
+    tri_metal_fuzz.from_numpy(fuzz_np)
+    tri_refraction_index.from_numpy(ior_np)
+    tri_emission.from_numpy(emission_np)
+    tri_normal.from_numpy(normal_np)
+    tri_has_smooth.from_numpy(smooth_np)
+    tri_n0.from_numpy(n0_np)
+    tri_n1.from_numpy(n1_np)
+    tri_n2.from_numpy(n2_np)
+
+    # ── Fill BVH fields (bulk upload via numpy) ──────────────────────────────
+    bvh_bbox_min.from_numpy(bmin_np)
+    bvh_bbox_max.from_numpy(bmax_np)
+    bvh_left.from_numpy(left_np)
+    bvh_right.from_numpy(right_np)
+    bvh_tri_start.from_numpy(ts_np)
+    bvh_tri_end.from_numpy(te_np)
+    bvh_tri_indices.from_numpy(tidx_np)
+
+    # ── Planes ───────────────────────────────────────────────────────────────
+    from objects import Plane, Sphere
+    planes  = [o for o in scene.objects if isinstance(o, Plane)]
+    spheres = [o for o in scene.objects if isinstance(o, Sphere)]
+    n_planes  = len(planes)
+    n_spheres = len(spheres)
+
+    if n_planes > 0:
+        plane_point    = ti.Vector.field(3, dtype=ti.f32, shape=n_planes)
+        plane_normal   = ti.Vector.field(3, dtype=ti.f32, shape=n_planes)
+        plane_colour   = ti.Vector.field(3, dtype=ti.f32, shape=n_planes)
+        plane_material = ti.field(dtype=ti.i32, shape=n_planes)
+        plane_metal_fuzz       = ti.field(dtype=ti.f32, shape=n_planes)
+        plane_refraction_index = ti.field(dtype=ti.f32, shape=n_planes)
+        plane_emission         = ti.field(dtype=ti.f32, shape=n_planes)
+        for i, p in enumerate(planes):
+            plane_point[i]    = p.center.astype(np.float32)
+            plane_normal[i]   = p.normal.astype(np.float32)
+            plane_colour[i]   = np.array([0.8, 0.8, 0.8], dtype=np.float32)  # checkerboard handled in shader
+            plane_material[i] = materials.get(p.material, 0)
+            plane_metal_fuzz[i]       = 0.0
+            plane_refraction_index[i] = 1.5
+            plane_emission[i]         = 0.0
+    else:
+        # Allocate dummy 1-element fields so the kernel compiles
+        plane_point    = ti.Vector.field(3, dtype=ti.f32, shape=1)
+        plane_normal   = ti.Vector.field(3, dtype=ti.f32, shape=1)
+        plane_colour   = ti.Vector.field(3, dtype=ti.f32, shape=1)
+        plane_material = ti.field(dtype=ti.i32, shape=1)
+        plane_metal_fuzz       = ti.field(dtype=ti.f32, shape=1)
+        plane_refraction_index = ti.field(dtype=ti.f32, shape=1)
+        plane_emission         = ti.field(dtype=ti.f32, shape=1)
+
+    if n_spheres > 0:
+        sphere_center   = ti.Vector.field(3, dtype=ti.f32, shape=n_spheres)
+        sphere_radius   = ti.field(dtype=ti.f32, shape=n_spheres)
+        sphere_colour   = ti.Vector.field(3, dtype=ti.f32, shape=n_spheres)
+        sphere_material = ti.field(dtype=ti.i32, shape=n_spheres)
+        sphere_metal_fuzz       = ti.field(dtype=ti.f32, shape=n_spheres)
+        sphere_refraction_index = ti.field(dtype=ti.f32, shape=n_spheres)
+        sphere_emission         = ti.field(dtype=ti.f32, shape=n_spheres)
+        for i, s in enumerate(spheres):
+            sphere_center[i]   = s.center.astype(np.float32)
+            sphere_radius[i]   = float(s.radius)
+            sphere_colour[i]   = s.colour.astype(np.float32)
+            sphere_material[i] = materials.get(s.material, 0)
+            sphere_metal_fuzz[i]       = float(s.metal_fuzz)
+            sphere_refraction_index[i] = float(s.refraction_index)
+            sphere_emission[i]         = float(s.emission_intensity)
+    else:
+        sphere_center   = ti.Vector.field(3, dtype=ti.f32, shape=1)
+        sphere_radius   = ti.field(dtype=ti.f32, shape=1)
+        sphere_colour   = ti.Vector.field(3, dtype=ti.f32, shape=1)
+        sphere_material = ti.field(dtype=ti.i32, shape=1)
+        sphere_metal_fuzz       = ti.field(dtype=ti.f32, shape=1)
+        sphere_refraction_index = ti.field(dtype=ti.f32, shape=1)
+        sphere_emission         = ti.field(dtype=ti.f32, shape=1)
+
+    print(f"[Build] {n_planes} plane(s), {n_spheres} sphere(s) uploaded.")
+    print(f"[Build] Done.")
+
+
+@ti.kernel
+def _clear():
+    for j, i in ti.ndrange(Config.img_height, Config.img_width):
+        framebuffer[j, i] = tm.vec3(0.0)
+
+
+def run():
+    """Clear framebuffer, run the render kernel, save output."""
+    import os, time
+    os.makedirs("img", exist_ok=True)
+    os.makedirs("hdr", exist_ok=True)
+
+    print(f"[Render] Rendering {Config.img_width}x{Config.img_height}, {Config.antialising_samples} spp...")
+    _clear()
     t0 = time.time()
-    render_core(world, shared)
-
-    stop_preview.set()
-    thread.join()
-
+    render()
+    ti.sync()
     elapsed = time.time() - t0
-    print(f"[Render] Render complete in {elapsed:.1f}s ({elapsed/60:.1f} min)")
+    print(f"[Render] Done in {elapsed:.1f}s")
 
-    # Save final HDR buffer and apply post-processing
-    np.save(Config.hdr_save_path, framebuffer.copy())
-    print(f"[Render] Applying post-processing...")
-    out = apply_effect(framebuffer)
+    img = framebuffer.to_numpy()                    # (H, W, 3) float32 — raw HDR
+    np.save(Config.hdr_save_path, img)
+    img_mapped = _tone_map_np(img)                  # HDR → [0, 1]
+    out = apply_effect(img_mapped)                  # bloom on tone-mapped image
     cv2.imwrite(Config.save_path, cv2.cvtColor(out, cv2.COLOR_RGB2BGR))
     print(f"[Render] Saved {Config.save_path}")
 
-def init_worker(world, array):
-    global shared_world, shared_array
-    shared_world = world
-    shared_array = array
-    warmup()  # JIT compile the functions in the worker process
 
-def warmup():
-    # JIT warmup — compile all @njit functions before rendering begins
-    _v = np.array([1.0, 2.0, 3.0])
-    normalize(_v)
-    lerp(np.array([1.0, 1.0, 1.0]), np.array([0.5, 0.7, 1.0]), 0.5)
-    _aabb_hit(np.zeros(3), np.ones(3), np.zeros(3), np.array([1.0, 1.0, 1.0]), 0.0, 1e30)
-    background(_v)
+def _tone_map_np(hdr: np.ndarray) -> np.ndarray:
+    """Apply filmic (ACES approximation) tone mapping to a float32 HDR image."""
+    a, b, c, d, e = 2.51, 0.03, 2.43, 0.59, 0.14
+    return np.clip((hdr * (a * hdr + b)) / (hdr * (c * hdr + d) + e), 0.0, 1.0)

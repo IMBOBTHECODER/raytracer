@@ -1,6 +1,8 @@
-from functions import normalize
 import numpy as np
 
+
+def normalize(n):
+    return n / np.linalg.norm(n)
 
 class Plane:
     def __init__(self, point: np.ndarray, normal: np.ndarray, colour_multiplier=0.9):

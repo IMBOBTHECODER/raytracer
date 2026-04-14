@@ -1,9 +1,11 @@
 from config import Config
 import numpy as np
-from functions import normalize
 from numba import njit
 import multiprocessing as mp
 
+@njit(cache=True)
+def normalize(n):
+    return n / np.linalg.norm(n)
 
 @njit(cache=True)
 def _aabb_hit(bbox_min: np.ndarray, bbox_max: np.ndarray, ray_o: np.ndarray, ray_d: np.ndarray, t_min: float, t_max: float) -> bool:

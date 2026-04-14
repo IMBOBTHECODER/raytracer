@@ -7,9 +7,9 @@ class Config:
     img_height = 512
     aspect_ratio = img_width / img_height
 
-    lookfrom = np.array([3.0, 1.5, 2.0])   # camera position
-    lookat = np.array([0.0, 0.5, -2.0])   # point camera is looking at
-    vup = np.array([0.0, 1.0, 0.0])       # "up" direction for the camera
+    lookfrom = np.array([12.0, 5.0, 10.0], dtype=np.float32)  # camera position
+    lookat   = np.array([0.0,  1.0, -2.0], dtype=np.float32)  # point camera is looking at
+    vup = np.array([0.0, 1.0, 0.0],  dtype=np.float32)       # "up" direction for the camera
 
 
     # focal_length is the distance from the camera to the viewport
@@ -24,6 +24,7 @@ class Config:
     # The camera poistion (currently the orgin)
     camera_center = lookfrom
 
+
     # 5-10 samples (development), 50-100 samples (final)
     antialising_samples = 16 # number of rays to shoot per pixel for anti-aliasing
 
@@ -36,6 +37,4 @@ class Config:
     aperture = 0.01  # aperture size for depth of field (0 = pinhole camera, larger  = more blur)
     focus_dist = np.linalg.norm(lookfrom - lookat) # distance from camera to the plane in focus (used for depth of field calculations)
 
-    tile_size = 32    # pixels per tile side — smaller = better load balance, more overhead
-    num_workers = 16  # number of worker processes; increase for more parallelism, decrease to save memory
-    starmap_chunksize = 4  # tiles per IPC message — higher = less overhead, lower = better load balance
+    num_workers = 18  # number of worker processes; increase for more parallelism, decrease to save memory
