@@ -4,7 +4,7 @@ import cv2
 import taichi as ti
 import taichi.math as tm
 
-ti.init(arch=ti.cpu)
+ti.init(arch=ti.gpu)
 
 tri_v0              = None
 tri_v1              = None
