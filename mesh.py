@@ -3,6 +3,37 @@ import numpy as np
 import multiprocessing as mp
 
 
+def _get_prop(props, name, default):
+    """Read a named property from a pyassimp material properties dict."""
+    for (key, _), value in props.items():
+        if key.lower() == name:
+            return value
+    return default
+
+
+def _map_material(mat):
+    """
+    Convert a pyassimp material into the renderer's material system.
+    Returns (material_str, colour, metal_fuzz, refraction_index, emission_intensity).
+    """
+    props = mat.properties
+    diffuse   = np.array(_get_prop(props, "diffuse",   [1, 1, 1]), dtype=np.float32)
+    emissive  = np.array(_get_prop(props, "emissive",  [0, 0, 0]), dtype=np.float32)
+    opacity   = float(_get_prop(props, "opacity",   1.0))
+    shininess = float(_get_prop(props, "shininess", 0.0))
+
+    if float(emissive.max()) > 0.1:
+        material = "emissive"
+        emission = float(emissive.max())
+        return material, diffuse, 0.0, 1.0, emission
+    if opacity < 0.98:
+        return "glass", diffuse, 0.0, 1.5, 0.0
+    if shininess > 50:
+        fuzz = max(0.0, min(1.0, 1.0 - shininess / 100.0))
+        return "metal", diffuse, fuzz, 1.0, 0.0
+    return None, diffuse, 0.0, 1.0, 0.0  # diffuse
+
+
 class Triangle:
     """A single triangle primitive. Stores geometry and material for GPU upload."""
     __slots__ = ('v0', 'v1', 'v2', '_normal', 'n0', 'n1', 'n2',
@@ -94,7 +125,8 @@ class BVHNode:
 
     @classmethod
     def build_parallel(cls, vertices, faces, face_normals, normals, normal_faces, num_workers,
-                       colour, material, metal_fuzz, emission_intensity, refraction_index):
+                       colour, material, metal_fuzz, emission_intensity, refraction_index,
+                       face_mats=None):
         print(f"[BVH] Splitting {len(faces):,} triangles into {num_workers} chunks...")
 
         centroids = (vertices[faces[:, 0]] + vertices[faces[:, 1]] + vertices[faces[:, 2]]) / 3.0
@@ -104,26 +136,26 @@ class BVHNode:
         sorted_faces        = faces[order]
         sorted_face_normals = face_normals[order]
         sorted_normal_faces = normal_faces[order] if normal_faces is not None else None
+        sorted_face_mats    = {k: v[order] for k, v in face_mats.items()} if face_mats is not None else None
 
         size = len(sorted_faces) // num_workers
-        chunks = [
-            sorted_faces[i * size : (i + 1) * size if i < num_workers - 1 else len(sorted_faces)]
-            for i in range(num_workers)
-        ]
-        fn_chunks = [
-            sorted_face_normals[i * size : (i + 1) * size if i < num_workers - 1 else len(sorted_face_normals)]
-            for i in range(num_workers)
-        ]
-        normal_chunks = [
-            sorted_normal_faces[i * size : (i + 1) * size if i < num_workers - 1 else len(sorted_normal_faces)]
-            for i in range(num_workers)
-        ] if sorted_normal_faces is not None else [None] * num_workers
+        def chunk(arr, i):
+            lo = i * size
+            hi = (i + 1) * size if i < num_workers - 1 else len(sorted_faces)
+            return arr[lo:hi]
 
         print(f"[BVH] Building {num_workers} sub-trees in parallel...")
 
-        args = [(vertices, chunk, fn_chunk, normals, nchunk, colour, material, metal_fuzz,
-                 emission_intensity, refraction_index)
-                for chunk, fn_chunk, nchunk in zip(chunks, fn_chunks, normal_chunks)]
+        args = [
+            (vertices,
+             chunk(sorted_faces, i),
+             chunk(sorted_face_normals, i),
+             normals,
+             chunk(sorted_normal_faces, i) if sorted_normal_faces is not None else None,
+             colour, material, metal_fuzz, emission_intensity, refraction_index,
+             {k: chunk(v, i) for k, v in sorted_face_mats.items()} if sorted_face_mats is not None else None)
+            for i in range(num_workers)
+        ]
 
         with mp.Pool(processes=num_workers) as pool:
             subtrees = pool.map(_build_bvh_subtree, args)
@@ -140,7 +172,7 @@ class BVHNode:
 
 
 def _build_bvh_subtree(args):
-    vertices, face_chunk, fn_chunk, normals, normal_face_chunk, colour, material, metal_fuzz, emission_intensity, refraction_index = args
+    vertices, face_chunk, fn_chunk, normals, normal_face_chunk, colour, material, metal_fuzz, emission_intensity, refraction_index, face_mats = args
     n = len(face_chunk)
     triangles = [None] * n
     for i in range(n):
@@ -150,10 +182,19 @@ def _build_bvh_subtree(args):
             nf = normal_face_chunk[i]
             if nf[0] >= 0 and nf[1] >= 0 and nf[2] >= 0:
                 n0, n1, n2 = normals[nf[0]], normals[nf[1]], normals[nf[2]]
+        # Use per-face FBX materials if available, else fall back to scalar params
+        if face_mats is not None:
+            c  = face_mats['colour'][i]
+            m  = face_mats['material'][i]
+            fz = float(face_mats['fuzz'][i])
+            ir = float(face_mats['ior'][i])
+            em = float(face_mats['emission'][i])
+        else:
+            c, m, fz, ir, em = colour, material, metal_fuzz, refraction_index, emission_intensity
         triangles[i] = Triangle(
             vertices[f[0]], vertices[f[1]], vertices[f[2]], fn_chunk[i],
-            colour=colour, material=material, metal_fuzz=metal_fuzz,
-            emission_intensity=emission_intensity, refraction_index=refraction_index,
+            colour=c, material=m, metal_fuzz=fz,
+            emission_intensity=em, refraction_index=ir,
             n0=n0, n1=n1, n2=n2,
         )
     return BVHNode(triangles)
@@ -166,7 +207,7 @@ class Mesh:
         self.colour = colour
         self.material = material
 
-        vertices, faces, face_normals, normals, normal_faces = self._load_obj(
+        vertices, faces, face_normals, normals, normal_faces, face_mats = self._load_file(
             filepath, scale, np.zeros(3) if translate is None else translate,
         )
         smooth = normal_faces is not None
@@ -175,6 +216,7 @@ class Mesh:
             vertices, faces, face_normals, normals, normal_faces, Config.num_workers,
             colour=colour, material=material, metal_fuzz=metal_fuzz,
             emission_intensity=emission_intensity, refraction_index=refraction_index,
+            face_mats=face_mats,
         )
 
     @staticmethod
@@ -255,6 +297,85 @@ class Mesh:
         faces = np.array(face_list, dtype=np.int32)
         normal_faces = np.array(normal_face_list, dtype=np.int32) if has_normals else None
         return faces, normal_faces
+
+    @staticmethod
+    def _load_file(filepath, scale, translate):
+        ext = filepath.rsplit('.', 1)[-1].lower()
+        if ext == 'obj':
+            result = Mesh._load_obj(filepath, scale, translate)
+            return result + (None,)   # no per-face materials for OBJ
+        return Mesh._load_assimp(filepath, scale, translate)
+
+    @staticmethod
+    def _load_assimp(filepath, scale, translate):
+        import pyassimp
+        import pyassimp.postprocess as pp
+        print(f"[Mesh] Reading {filepath} via pyassimp...")
+        scene = pyassimp.load(
+            filepath,
+            processing=(
+                pp.aiProcess_Triangulate |
+                pp.aiProcess_GenSmoothNormals |
+                pp.aiProcess_JoinIdenticalVertices
+            )
+        )
+        if not scene.meshes:
+            raise ValueError(f"No meshes found in {filepath}")
+
+        all_verts, all_faces, all_norms = [], [], []
+        # Per-face material data — populated from FBX material properties
+        all_colours, all_materials, all_fuzz, all_ior, all_emission = [], [], [], [], []
+        vert_offset = 0
+
+        for m in scene.meshes:
+            verts = np.array(m.vertices, dtype=np.float64)
+            faces = np.array(m.faces,    dtype=np.int32) + vert_offset
+            norms = np.array(m.normals,  dtype=np.float64)
+            n_faces = len(faces)
+
+            # Read material from the FBX scene
+            mat = scene.materials[m.materialindex]
+            mat_str, colour, fuzz, ior, emission = _map_material(mat)
+
+            all_verts.append(verts)
+            all_faces.append(faces)
+            all_norms.append(norms)
+            all_colours.append(np.tile(colour, (n_faces, 1)))
+            all_materials.append(np.full(n_faces, mat_str,  dtype=object))
+            all_fuzz.append(    np.full(n_faces, fuzz,      dtype=np.float64))
+            all_ior.append(     np.full(n_faces, ior,       dtype=np.float64))
+            all_emission.append(np.full(n_faces, emission,  dtype=np.float64))
+            vert_offset += len(verts)
+
+        pyassimp.release(scene)
+
+        vertices = np.concatenate(all_verts, axis=0) * scale + translate
+        faces    = np.concatenate(all_faces, axis=0)
+        normals  = np.concatenate(all_norms, axis=0)
+
+        # Normalize vertex normals
+        lens = np.linalg.norm(normals, axis=1, keepdims=True)
+        normals = normals / np.where(lens > 0, lens, 1.0)
+
+        # normal_faces == faces (assimp gives per-vertex normals)
+        normal_faces = faces.copy()
+
+        # Flat face normals for BVH construction
+        e1 = vertices[faces[:, 1]] - vertices[faces[:, 0]]
+        e2 = vertices[faces[:, 2]] - vertices[faces[:, 0]]
+        crosses = np.cross(e1, e2)
+        lens = np.linalg.norm(crosses, axis=1, keepdims=True)
+        face_normals = crosses / np.where(lens > 1e-12, lens, 1.0)
+
+        face_mats = {
+            'colour':   np.concatenate(all_colours,  axis=0).astype(np.float64),
+            'material': np.concatenate(all_materials, axis=0),  # object array of strings/None
+            'fuzz':     np.concatenate(all_fuzz,     axis=0),
+            'ior':      np.concatenate(all_ior,      axis=0),
+            'emission': np.concatenate(all_emission, axis=0),
+        }
+
+        return vertices, faces, face_normals.astype(np.float64), normals, normal_faces, face_mats
 
     @staticmethod
     def _load_obj(filepath, scale, translate):

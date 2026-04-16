@@ -1,3 +1,4 @@
+import pyassimp
 from config import Config
 import numpy as np
 import cv2
@@ -52,6 +53,7 @@ sphere_emission         = None
 n_spheres = 0
 
 framebuffer = ti.Vector.field(3, dtype=ti.f32, shape=(Config.img_height, Config.img_width))
+
 
 @ti.func
 def lerp(a, b, t):
@@ -464,8 +466,10 @@ def render():
 
         framebuffer[j, i] /= antialising_samples  # average the samples for anti-aliasing
 
+
 def gather_triangles(scene):
     """Walk the scene and collect all Triangle objects into a flat list."""
+    from mesh import BVHNode
     tris = []
     stack = []
     for obj in scene.objects:
@@ -563,10 +567,21 @@ def build(scene):
 
     materials = {None: 0, "metal": 1, "glass": 2, "emissive": 3, "absorbing": 4}
 
-    # ── Extract triangle data into numpy arrays first ────────────────────────
+    # ── Extract triangle data into numpy arrays ──────────────────────────────
     v0_np  = np.array([t.v0  for t in all_tris], dtype=np.float32)
     v1_np  = np.array([t.v1  for t in all_tris], dtype=np.float32)
     v2_np  = np.array([t.v2  for t in all_tris], dtype=np.float32)
+
+    colour_np   = np.array([t.colour.astype(np.float32)                       for t in all_tris], dtype=np.float32)
+    material_np = np.array([materials.get(t.material, 0)                      for t in all_tris], dtype=np.int32)
+    fuzz_np     = np.array([t.metal_fuzz                                       for t in all_tris], dtype=np.float32)
+    ior_np      = np.array([t.refraction_index                                 for t in all_tris], dtype=np.float32)
+    emission_np = np.array([t.emission_intensity                               for t in all_tris], dtype=np.float32)
+    normal_np   = np.array([t._normal.astype(np.float32)                      for t in all_tris], dtype=np.float32)
+    smooth_np   = np.array([1 if t.n0 is not None else 0                      for t in all_tris], dtype=np.int32)
+    n0_np = np.array([t.n0 if t.n0 is not None else t._normal for t in all_tris], dtype=np.float32)
+    n1_np = np.array([t.n1 if t.n1 is not None else t._normal for t in all_tris], dtype=np.float32)
+    n2_np = np.array([t.n2 if t.n2 is not None else t._normal for t in all_tris], dtype=np.float32)
 
     # ── Build flat BVH ───────────────────────────────────────────────────────
     print(f"[Build] Building BVH...")
@@ -597,18 +612,6 @@ def build(scene):
     bvh_tri_start   = ti.field(dtype=ti.i32, shape=n_nodes)
     bvh_tri_end     = ti.field(dtype=ti.i32, shape=n_nodes)
     bvh_tri_indices = ti.field(dtype=ti.i32, shape=len(tidx_np))
-
-    # ── Fill triangle fields (bulk numpy upload) ─────────────────────────────
-    colour_np   = np.array([t.colour.astype(np.float32)   for t in all_tris], dtype=np.float32)
-    material_np = np.array([materials.get(t.material, 0)  for t in all_tris], dtype=np.int32)
-    fuzz_np     = np.array([t.metal_fuzz                  for t in all_tris], dtype=np.float32)
-    ior_np      = np.array([t.refraction_index             for t in all_tris], dtype=np.float32)
-    emission_np = np.array([t.emission_intensity           for t in all_tris], dtype=np.float32)
-    normal_np   = np.array([t._normal.astype(np.float32)  for t in all_tris], dtype=np.float32)
-    smooth_np   = np.array([1 if t.n0 is not None else 0  for t in all_tris], dtype=np.int32)
-    n0_np = np.array([t.n0 if t.n0 is not None else t._normal for t in all_tris], dtype=np.float32)
-    n1_np = np.array([t.n1 if t.n1 is not None else t._normal for t in all_tris], dtype=np.float32)
-    n2_np = np.array([t.n2 if t.n2 is not None else t._normal for t in all_tris], dtype=np.float32)
 
     tri_v0.from_numpy(v0_np)
     tri_v1.from_numpy(v1_np)
