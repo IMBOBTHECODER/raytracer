@@ -203,7 +203,7 @@ def _build_bvh_subtree(args):
 class Mesh:
     def __init__(self, filepath: str, colour: np.ndarray, material=None,
                  metal_fuzz=0.0, emission_intensity=5.0, refraction_index=1.5,
-                 scale=1.0, translate=None):
+                 scale=1.0, translate=None, ignore_fbx_materials=False):
         self.colour = colour
         self.material = material
 
@@ -216,7 +216,7 @@ class Mesh:
             vertices, faces, face_normals, normals, normal_faces, Config.num_workers,
             colour=colour, material=material, metal_fuzz=metal_fuzz,
             emission_intensity=emission_intensity, refraction_index=refraction_index,
-            face_mats=face_mats,
+            face_mats=None if ignore_fbx_materials else face_mats,
         )
 
     @staticmethod

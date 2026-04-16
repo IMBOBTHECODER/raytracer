@@ -25,6 +25,8 @@ if __name__ == "__main__":
                         help="Multiple lookfrom positions — renders one image per view, "
                              "BVH built only once. Use with --lookat for the shared target. "
                              "Example: --views \"5 2 8\" \"10 3 0\" \"-5 2 8\"")
+    parser.add_argument("--ignore-fbx-materials", action="store_true",
+                        help="Ignore FBX material data and use --colour/--material instead")
     parser.add_argument("--bvh",       type=str,   default=None,
                         metavar="PATH",
                         help="Path to a .npz scene cache. If the file exists, skip BVH "
@@ -55,6 +57,7 @@ if __name__ == "__main__":
             material=args.material,
             scale=args.scale,
             translate=np.array(args.translate),
+            ignore_fbx_materials=args.ignore_fbx_materials,
         ))
         scene.add_object(objects.Sphere(
             center=np.array([8.0, 10.0, 4.0]),
