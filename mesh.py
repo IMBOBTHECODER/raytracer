@@ -311,43 +311,38 @@ class Mesh:
         import pyassimp
         import pyassimp.postprocess as pp
         print(f"[Mesh] Reading {filepath} via pyassimp...")
-        scene = pyassimp.load(
-            filepath,
-            processing=(
-                pp.aiProcess_Triangulate |
-                pp.aiProcess_GenSmoothNormals |
-                pp.aiProcess_JoinIdenticalVertices
-            )
+        processing = (
+            pp.aiProcess_Triangulate |
+            pp.aiProcess_GenSmoothNormals |
+            pp.aiProcess_JoinIdenticalVertices
         )
-        if not scene.meshes:
-            raise ValueError(f"No meshes found in {filepath}")
 
         all_verts, all_faces, all_norms = [], [], []
-        # Per-face material data — populated from FBX material properties
         all_colours, all_materials, all_fuzz, all_ior, all_emission = [], [], [], [], []
         vert_offset = 0
 
-        for m in scene.meshes:
-            verts = np.array(m.vertices, dtype=np.float64)
-            faces = np.array(m.faces,    dtype=np.int32) + vert_offset
-            norms = np.array(m.normals,  dtype=np.float64)
-            n_faces = len(faces)
+        with pyassimp.load(filepath, processing=processing) as scene:
+            if not scene.meshes:
+                raise ValueError(f"No meshes found in {filepath}")
 
-            # Read material from the FBX scene
-            mat = scene.materials[m.materialindex]
-            mat_str, colour, fuzz, ior, emission = _map_material(mat)
+            for m in scene.meshes:
+                verts = np.array(m.vertices, dtype=np.float64)
+                faces = np.array(m.faces,    dtype=np.int32) + vert_offset
+                norms = np.array(m.normals,  dtype=np.float64)
+                n_faces = len(faces)
 
-            all_verts.append(verts)
-            all_faces.append(faces)
-            all_norms.append(norms)
-            all_colours.append(np.tile(colour, (n_faces, 1)))
-            all_materials.append(np.full(n_faces, mat_str,  dtype=object))
-            all_fuzz.append(    np.full(n_faces, fuzz,      dtype=np.float64))
-            all_ior.append(     np.full(n_faces, ior,       dtype=np.float64))
-            all_emission.append(np.full(n_faces, emission,  dtype=np.float64))
-            vert_offset += len(verts)
+                mat = scene.materials[m.materialindex]
+                mat_str, colour, fuzz, ior, emission = _map_material(mat)
 
-        pyassimp.release(scene)
+                all_verts.append(verts)
+                all_faces.append(faces)
+                all_norms.append(norms)
+                all_colours.append(np.tile(colour, (n_faces, 1)))
+                all_materials.append(np.full(n_faces, mat_str,  dtype=object))
+                all_fuzz.append(    np.full(n_faces, fuzz,      dtype=np.float64))
+                all_ior.append(     np.full(n_faces, ior,       dtype=np.float64))
+                all_emission.append(np.full(n_faces, emission,  dtype=np.float64))
+                vert_offset += len(verts)
 
         vertices = np.concatenate(all_verts, axis=0) * scale + translate
         faces    = np.concatenate(all_faces, axis=0)

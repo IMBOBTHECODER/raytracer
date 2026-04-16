@@ -1,3 +1,4 @@
 taichi
 numpy
 opencv-python
+pyassimp
