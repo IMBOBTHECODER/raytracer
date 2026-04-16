@@ -17,10 +17,10 @@ def _map_material(mat):
     Returns (material_str, colour, metal_fuzz, refraction_index, emission_intensity).
     """
     props = mat.properties
-    diffuse   = np.array(_get_prop(props, "diffuse",   [1, 1, 1]), dtype=np.float32)
-    emissive  = np.array(_get_prop(props, "emissive",  [0, 0, 0]), dtype=np.float32)
-    opacity   = float(_get_prop(props, "opacity",   1.0))
-    shininess = float(_get_prop(props, "shininess", 0.0))
+    diffuse   = np.array(_get_prop(props, "diffuse",   [1, 1, 1]), dtype=np.float32).flatten()[:3]
+    emissive  = np.array(_get_prop(props, "emissive",  [0, 0, 0]), dtype=np.float32).flatten()[:3]
+    opacity   = float(np.array(_get_prop(props, "opacity",   1.0)).flat[0])
+    shininess = float(np.array(_get_prop(props, "shininess", 0.0)).flat[0])
 
     if float(emissive.max()) > 0.1:
         material = "emissive"
