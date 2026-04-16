@@ -5,8 +5,8 @@ import multiprocessing as mp
 
 def _get_prop(props, name, default):
     """Read a named property from a pyassimp material properties dict."""
-    for (key, _), value in props.items():
-        if key.lower() == name:
+    for key_tuple, value in props.items():
+        if key_tuple[0].lower() == name:
             return value
     return default
 
