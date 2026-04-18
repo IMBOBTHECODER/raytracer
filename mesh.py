@@ -404,7 +404,9 @@ class Mesh:
 
             # Build texture path list from all materials upfront
             for mat in scene.materials:
-                for (name, sem, _), val in mat.properties.items():
+                for key, val in mat.properties.items():
+                    name = key[0] if isinstance(key, tuple) else key
+                    sem  = key[1] if isinstance(key, tuple) and len(key) > 1 else 0
                     if '$tex.file' in name and sem == 1 and isinstance(val, str) and val not in path_to_id:
                         path_to_id[val] = len(tex_paths)
                         tex_paths.append(val)
