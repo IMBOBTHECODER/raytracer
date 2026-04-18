@@ -449,22 +449,32 @@ class Mesh:
                 for i, etex in enumerate(scene.textures):
                     key = f"*{i}"
                     try:
-                        addr = _ct.addressof(etex.data[0])
+                        n_bytes = etex.width if etex.height == 0 else etex.width * etex.height * 4
+                        # pyassimp wraps pcData as a size-0 numpy array; extract the raw C pointer
+                        data_obj = etex.data
+                        if isinstance(data_obj, np.ndarray):
+                            addr = data_obj.ctypes.data          # int: address of backing C buffer
+                        else:
+                            try:
+                                addr = _ct.cast(data_obj, _ct.c_void_p).value   # ctypes POINTER
+                            except TypeError:
+                                addr = _ct.addressof(data_obj)   # ctypes array
+                        if not addr:
+                            raise ValueError("null texture data pointer")
+                        raw = _ct.string_at(addr, n_bytes)
                         if etex.height == 0:
-                            # Compressed PNG/JPG; etex.width == byte count
-                            raw = _ct.string_at(addr, etex.width)
                             buf = np.frombuffer(raw, dtype=np.uint8)
                             img = _cv2.imdecode(buf, _cv2.IMREAD_COLOR)
                             if img is not None:
                                 tex_preloaded[key] = _cv2.cvtColor(img, _cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
                         else:
-                            # Raw BGRA8888: etex.width * etex.height texels, 4 bytes each
-                            n_bytes = etex.width * etex.height * 4
-                            raw = _ct.string_at(addr, n_bytes)
-                            data = np.frombuffer(raw, dtype=np.uint8).reshape(etex.height, etex.width, 4)
-                            tex_preloaded[key] = data[:, :, [2, 1, 0]].astype(np.float32) / 255.0
+                            data_arr = np.frombuffer(raw, dtype=np.uint8).reshape(etex.height, etex.width, 4)
+                            tex_preloaded[key] = data_arr[:, :, [2, 1, 0]].astype(np.float32) / 255.0
                     except Exception as e:
-                        print(f"[Mesh] Warning: embedded texture *{i} failed: {e}")
+                        print(f"[Mesh] Warning: embedded texture *{i} failed: {e} "
+                              f"(data type={type(etex.data).__name__}, "
+                              f"shape={getattr(etex.data, 'shape', 'n/a')}, "
+                              f"width={etex.width}, height={etex.height})")
 
             # Build texture path list from all materials upfront
             for mat in scene.materials:
