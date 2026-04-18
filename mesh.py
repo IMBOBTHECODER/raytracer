@@ -431,7 +431,9 @@ class Mesh:
 
                 # Texture ID for this submesh's material
                 tex_id_m = -1
-                for (name, sem, _), val in mat.properties.items():
+                for key, val in mat.properties.items():
+                    name = key[0] if isinstance(key, tuple) else key
+                    sem  = key[1] if isinstance(key, tuple) and len(key) > 1 else 0
                     if '$tex.file' in name and sem == 1 and isinstance(val, str):
                         tex_id_m = path_to_id.get(val, -1)
                         break
