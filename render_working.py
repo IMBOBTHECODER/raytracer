@@ -7,7 +7,7 @@ import numpy as np
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("model", help="Path to .obj or .fbx file")
+    parser.add_argument("model", help="Path to .obj, .fbx, or .glb file")
     parser.add_argument("--scale",     type=float, default=0.1)
     parser.add_argument("--colour",    type=float, nargs=3, default=[0.192, 0.549, 0.906], metavar=("R", "G", "B"))
     parser.add_argument("--roughness",    type=float, default=1.0)

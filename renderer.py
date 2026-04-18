@@ -846,25 +846,25 @@ def save_scene(path):
     np.savez_compressed(
         path,
         # triangles
-        tri_v0               = tri_v0.to_numpy(),
-        tri_v1               = tri_v1.to_numpy(),
-        tri_v2               = tri_v2.to_numpy(),
-        tri_colour           = tri_colour.to_numpy(),
-        tri_material         = tri_material.to_numpy(),
-        tri_metal_fuzz       = tri_metal_fuzz.to_numpy(),
-        tri_refraction_index = tri_refraction_index.to_numpy(),
-        tri_emission         = tri_emission.to_numpy(),
-        tri_normal           = tri_normal.to_numpy(),
-        tri_n0               = tri_n0.to_numpy(),
-        tri_n1               = tri_n1.to_numpy(),
-        tri_n2               = tri_n2.to_numpy(),
-        tri_has_smooth       = tri_has_smooth.to_numpy(),
-        tri_uv0              = tri_uv0.to_numpy(),
-        tri_uv1              = tri_uv1.to_numpy(),
-        tri_uv2              = tri_uv2.to_numpy(),
-        tri_tex_id           = tri_tex_id.to_numpy(),
-        n_textures           = np.array(n_textures),
-        tex_atlas            = tex_atlas.to_numpy(),
+        tri_v0           = tri_v0.to_numpy(),
+        tri_v1           = tri_v1.to_numpy(),
+        tri_v2           = tri_v2.to_numpy(),
+        tri_colour       = tri_colour.to_numpy(),
+        tri_roughness    = tri_roughness.to_numpy(),
+        tri_metalness    = tri_metalness.to_numpy(),
+        tri_transmission = tri_transmission.to_numpy(),
+        tri_emission     = tri_emission.to_numpy(),
+        tri_normal       = tri_normal.to_numpy(),
+        tri_n0           = tri_n0.to_numpy(),
+        tri_n1           = tri_n1.to_numpy(),
+        tri_n2           = tri_n2.to_numpy(),
+        tri_has_smooth   = tri_has_smooth.to_numpy(),
+        tri_uv0          = tri_uv0.to_numpy(),
+        tri_uv1          = tri_uv1.to_numpy(),
+        tri_uv2          = tri_uv2.to_numpy(),
+        tri_tex_id       = tri_tex_id.to_numpy(),
+        n_textures       = np.array(n_textures),
+        tex_atlas        = tex_atlas.to_numpy(),
         # BVH
         bvh_bbox_min    = bvh_bbox_min.to_numpy(),
         bvh_bbox_max    = bvh_bbox_max.to_numpy(),
@@ -874,31 +874,31 @@ def save_scene(path):
         bvh_tri_end     = bvh_tri_end.to_numpy(),
         bvh_tri_indices = bvh_tri_indices.to_numpy(),
         # planes
-        n_planes               = np.array(n_planes),
-        plane_point            = plane_point.to_numpy(),
-        plane_normal           = plane_normal.to_numpy(),
-        plane_colour           = plane_colour.to_numpy(),
-        plane_material         = plane_material.to_numpy(),
-        plane_metal_fuzz       = plane_metal_fuzz.to_numpy(),
+        n_planes         = np.array(n_planes),
+        plane_point      = plane_point.to_numpy(),
+        plane_normal     = plane_normal.to_numpy(),
+        plane_colour     = plane_colour.to_numpy(),
+        plane_material   = plane_material.to_numpy(),
+        plane_metal_fuzz = plane_metal_fuzz.to_numpy(),
         plane_refraction_index = plane_refraction_index.to_numpy(),
-        plane_emission         = plane_emission.to_numpy(),
+        plane_emission   = plane_emission.to_numpy(),
         # spheres
-        n_spheres               = np.array(n_spheres),
-        sphere_center           = sphere_center.to_numpy(),
-        sphere_radius           = sphere_radius.to_numpy(),
-        sphere_colour           = sphere_colour.to_numpy(),
-        sphere_material         = sphere_material.to_numpy(),
+        n_spheres        = np.array(n_spheres),
+        sphere_center    = sphere_center.to_numpy(),
+        sphere_radius    = sphere_radius.to_numpy(),
+        sphere_colour    = sphere_colour.to_numpy(),
+        sphere_material  = sphere_material.to_numpy(),
         sphere_metal_fuzz       = sphere_metal_fuzz.to_numpy(),
         sphere_refraction_index = sphere_refraction_index.to_numpy(),
-        sphere_emission         = sphere_emission.to_numpy(),
+        sphere_emission  = sphere_emission.to_numpy(),
     )
     print(f"[Scene] Saved.")
 
 
 def load_scene(path):
     """Load a saved scene from .npz and upload directly to GPU, skipping BVH build."""
-    global tri_v0, tri_v1, tri_v2, tri_colour, tri_material
-    global tri_metal_fuzz, tri_refraction_index, tri_emission
+    global tri_v0, tri_v1, tri_v2, tri_colour
+    global tri_roughness, tri_metalness, tri_transmission, tri_emission
     global tri_normal, tri_n0, tri_n1, tri_n2, tri_has_smooth
     global tri_uv0, tri_uv1, tri_uv2, tri_tex_id
     global tex_atlas, n_textures
@@ -913,31 +913,31 @@ def load_scene(path):
     d = np.load(path)
 
     n  = len(d['tri_v0'])
-    tri_v0               = ti.Vector.field(3, dtype=ti.f32, shape=n)
-    tri_v1               = ti.Vector.field(3, dtype=ti.f32, shape=n)
-    tri_v2               = ti.Vector.field(3, dtype=ti.f32, shape=n)
-    tri_colour           = ti.Vector.field(3, dtype=ti.f32, shape=n)
-    tri_material         = ti.field(dtype=ti.i32, shape=n)
-    tri_metal_fuzz       = ti.field(dtype=ti.f32, shape=n)
-    tri_refraction_index = ti.field(dtype=ti.f32, shape=n)
-    tri_emission         = ti.field(dtype=ti.f32, shape=n)
-    tri_normal           = ti.Vector.field(3, dtype=ti.f32, shape=n)
-    tri_n0               = ti.Vector.field(3, dtype=ti.f32, shape=n)
-    tri_n1               = ti.Vector.field(3, dtype=ti.f32, shape=n)
-    tri_n2               = ti.Vector.field(3, dtype=ti.f32, shape=n)
-    tri_has_smooth       = ti.field(dtype=ti.i32, shape=n)
-    tri_uv0              = ti.Vector.field(2, dtype=ti.f32, shape=n)
-    tri_uv1              = ti.Vector.field(2, dtype=ti.f32, shape=n)
-    tri_uv2              = ti.Vector.field(2, dtype=ti.f32, shape=n)
-    tri_tex_id           = ti.field(dtype=ti.i32, shape=n)
+    tri_v0           = ti.Vector.field(3, dtype=ti.f32, shape=n)
+    tri_v1           = ti.Vector.field(3, dtype=ti.f32, shape=n)
+    tri_v2           = ti.Vector.field(3, dtype=ti.f32, shape=n)
+    tri_colour       = ti.Vector.field(3, dtype=ti.f32, shape=n)
+    tri_roughness    = ti.field(dtype=ti.f32, shape=n)
+    tri_metalness    = ti.field(dtype=ti.f32, shape=n)
+    tri_transmission = ti.field(dtype=ti.f32, shape=n)
+    tri_emission     = ti.Vector.field(3, dtype=ti.f32, shape=n)
+    tri_normal       = ti.Vector.field(3, dtype=ti.f32, shape=n)
+    tri_n0           = ti.Vector.field(3, dtype=ti.f32, shape=n)
+    tri_n1           = ti.Vector.field(3, dtype=ti.f32, shape=n)
+    tri_n2           = ti.Vector.field(3, dtype=ti.f32, shape=n)
+    tri_has_smooth   = ti.field(dtype=ti.i32, shape=n)
+    tri_uv0          = ti.Vector.field(2, dtype=ti.f32, shape=n)
+    tri_uv1          = ti.Vector.field(2, dtype=ti.f32, shape=n)
+    tri_uv2          = ti.Vector.field(2, dtype=ti.f32, shape=n)
+    tri_tex_id       = ti.field(dtype=ti.i32, shape=n)
 
     tri_v0.from_numpy(d['tri_v0'])
     tri_v1.from_numpy(d['tri_v1'])
     tri_v2.from_numpy(d['tri_v2'])
     tri_colour.from_numpy(d['tri_colour'])
-    tri_material.from_numpy(d['tri_material'])
-    tri_metal_fuzz.from_numpy(d['tri_metal_fuzz'])
-    tri_refraction_index.from_numpy(d['tri_refraction_index'])
+    tri_roughness.from_numpy(d['tri_roughness'])
+    tri_metalness.from_numpy(d['tri_metalness'])
+    tri_transmission.from_numpy(d['tri_transmission'])
     tri_emission.from_numpy(d['tri_emission'])
     tri_normal.from_numpy(d['tri_normal'])
     tri_n0.from_numpy(d['tri_n0'])

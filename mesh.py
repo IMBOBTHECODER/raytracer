@@ -235,7 +235,7 @@ class Mesh:
         _z3 = np.zeros(3, dtype=np.float32)
         self.emission = emission if emission is not None else _z3
 
-        vertices, faces, face_normals, normals, normal_faces, face_mats, uvs, uv_faces, tex_paths = \
+        vertices, faces, face_normals, normals, normal_faces, face_mats, uvs, uv_faces, tex_paths, tex_preloaded = \
             self._load_file(filepath, scale, np.zeros(3) if translate is None else translate)
 
         # Load texture images
@@ -243,6 +243,9 @@ class Mesh:
         self.textures = []
         _white = np.ones((1, 1, 3), dtype=np.float32)
         for p in (tex_paths or []):
+            if p in tex_preloaded:
+                self.textures.append(tex_preloaded[p])
+                continue
             full = p if os.path.isabs(p) else os.path.join(basedir, p)
             img  = cv2.imread(full) if os.path.exists(full) else None
             if img is not None:
@@ -382,7 +385,7 @@ class Mesh:
         if ext == 'obj':
             vertices, faces, face_normals, normals, normal_faces, uvs, uv_faces, tex_paths = \
                 Mesh._load_obj(filepath, scale, translate)
-            return vertices, faces, face_normals, normals, normal_faces, None, uvs, uv_faces, tex_paths
+            return vertices, faces, face_normals, normals, normal_faces, None, uvs, uv_faces, tex_paths, {}
         if ext == 'blend':
             return Mesh._load_blend(filepath, scale, translate)
         return Mesh._load_assimp(filepath, scale, translate)
@@ -407,13 +410,15 @@ class Mesh:
             script_path = os.path.join(tmpdir, "export.py")
             with open(script_path, "w") as f:
                 f.write(script)
-            subprocess.run(
+            result = subprocess.run(
                 [blender, "--background", os.path.abspath(filepath), "--python", script_path],
-                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                capture_output=True, text=True,
             )
+            if result.returncode != 0:
+                raise RuntimeError(f"Blender failed (exit {result.returncode}):\n{result.stderr[-2000:]}")
             vertices, faces, face_normals, normals, normal_faces, uvs, uv_faces, tex_paths = \
                 Mesh._load_obj(tmp_obj, scale, translate)
-        return vertices, faces, face_normals, normals, normal_faces, None, uvs, uv_faces, tex_paths
+        return vertices, faces, face_normals, normals, normal_faces, None, uvs, uv_faces, tex_paths, {}
 
     @staticmethod
     def _load_assimp(filepath, scale, translate):
@@ -429,6 +434,7 @@ class Mesh:
         all_verts, all_faces, all_norms, all_uvs = [], [], [], []
         all_colours, all_roughness, all_metalness, all_transmission, all_emission, all_tex_ids = [], [], [], [], [], []
         tex_paths = []
+        tex_preloaded = {}
         path_to_id = {}
         vert_offset = 0
         has_uvs = False
@@ -436,6 +442,27 @@ class Mesh:
         with pyassimp.load(filepath, processing=processing) as scene:
             if not scene.meshes:
                 raise ValueError(f"No meshes found in {filepath}")
+
+            # Extract embedded textures (path like "*0", "*1", ...)
+            if hasattr(scene, 'textures') and scene.textures:
+                import cv2 as _cv2
+                for i, etex in enumerate(scene.textures):
+                    key = f"*{i}"
+                    try:
+                        if etex.height == 0:
+                            # Compressed image data (PNG/JPG); etex.width == byte count
+                            raw = bytes(etex.data[:etex.width])
+                            buf = np.frombuffer(raw, dtype=np.uint8)
+                            img = _cv2.imdecode(buf, _cv2.IMREAD_COLOR)
+                            if img is not None:
+                                tex_preloaded[key] = _cv2.cvtColor(img, _cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+                        else:
+                            # Raw BGRA8888
+                            n_px = etex.width * etex.height
+                            data = np.frombuffer(bytes(etex.data[:n_px * 4]), dtype=np.uint8).reshape(etex.height, etex.width, 4)
+                            tex_preloaded[key] = data[:, :, [2, 1, 0]].astype(np.float32) / 255.0
+                    except Exception as e:
+                        print(f"[Mesh] Warning: embedded texture *{i} failed: {e}")
 
             # Build texture path list from all materials upfront
             for mat in scene.materials:
@@ -490,11 +517,20 @@ class Mesh:
                         tex_id_m = path_to_id.get(val, -1)
                         break
 
+                # Vertex colours: use per-face average when available and material has no real colour
+                raw_faces = np.array(m.faces, dtype=np.int32)
+                if (m.colors is not None and len(m.colors) > 0
+                        and m.colors[0] is not None and len(m.colors[0]) == n_verts):
+                    vc = np.array(m.colors[0], dtype=np.float32)[:, :3]
+                    face_col = (vc[raw_faces[:, 0]] + vc[raw_faces[:, 1]] + vc[raw_faces[:, 2]]) / 3.0
+                else:
+                    face_col = np.tile(colour, (n_faces, 1)).astype(np.float32)
+
                 all_verts.append(verts)
                 all_faces.append(faces_m)
                 all_norms.append(norms)
                 all_uvs.append(uvs_m)
-                all_colours.append(     np.tile(colour,    (n_faces, 1)).astype(np.float32))
+                all_colours.append(face_col)
                 all_roughness.append(   np.full(n_faces, roughness,    dtype=np.float32))
                 all_metalness.append(   np.full(n_faces, metalness,    dtype=np.float32))
                 all_transmission.append(np.full(n_faces, transmission, dtype=np.float32))
@@ -529,7 +565,7 @@ class Mesh:
 
         # uv_faces == faces: assimp gives per-vertex UVs after JoinIdenticalVertices
         uv_faces = faces.copy() if has_uvs else None
-        return vertices, faces, face_normals.astype(np.float64), normals, normal_faces, face_mats, uvs, uv_faces, tex_paths
+        return vertices, faces, face_normals.astype(np.float64), normals, normal_faces, face_mats, uvs, uv_faces, tex_paths, tex_preloaded
 
     @staticmethod
     def _load_obj(filepath, scale, translate):
