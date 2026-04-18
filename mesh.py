@@ -238,28 +238,33 @@ class Mesh:
         vertices, faces, face_normals, normals, normal_faces, face_mats, uvs, uv_faces, tex_paths, tex_preloaded = \
             self._load_file(filepath, scale, np.zeros(3) if translate is None else translate)
 
-        # Load texture images
+        # Load texture images — only keep ones that actually load; failed → tex_id -1
         basedir = os.path.dirname(os.path.abspath(filepath))
         self.textures = []
-        _white = np.ones((1, 1, 3), dtype=np.float32)
-        for p in (tex_paths or []):
+        tex_id_remap = {}  # original index in tex_paths → new index in self.textures
+        for i, p in enumerate(tex_paths or []):
+            img = None
             if p in tex_preloaded:
-                self.textures.append(tex_preloaded[p])
-                continue
-            full = p if os.path.isabs(p) else os.path.join(basedir, p)
-            img  = cv2.imread(full) if os.path.exists(full) else None
-            if img is not None:
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+                img = tex_preloaded[p]
             else:
-                img = _white
-                print(f"[Mesh] Warning: texture not found: {full!r} — using white fallback")
-            self.textures.append(img)
+                full = p if os.path.isabs(p) else os.path.join(basedir, p)
+                raw  = cv2.imread(full) if os.path.exists(full) else None
+                if raw is not None:
+                    img = cv2.cvtColor(raw, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+                else:
+                    print(f"[Mesh] Warning: texture not found: {full!r} — using material colour")
+            if img is not None:
+                tex_id_remap[i] = len(self.textures)
+                self.textures.append(img)
 
-        # Per-face texture IDs
+        # Per-face texture IDs — remap to pruned list; missing ones become -1
         n_faces = len(faces)
         if face_mats is not None and 'tex_id' in face_mats:
-            face_tex_ids = face_mats['tex_id'].astype(np.int32)
-        elif tex_paths:
+            raw_ids      = face_mats['tex_id'].astype(np.int32)
+            face_tex_ids = np.full(n_faces, -1, dtype=np.int32)
+            for old_id, new_id in tex_id_remap.items():
+                face_tex_ids[raw_ids == old_id] = new_id
+        elif tex_paths and self.textures:
             face_tex_ids = np.zeros(n_faces, dtype=np.int32)
         else:
             face_tex_ids = np.full(n_faces, -1, dtype=np.int32)
@@ -428,7 +433,8 @@ class Mesh:
         processing = (
             pp.aiProcess_Triangulate |
             pp.aiProcess_GenSmoothNormals |
-            pp.aiProcess_JoinIdenticalVertices
+            pp.aiProcess_JoinIdenticalVertices |
+            pp.aiProcess_PreTransformVertices
         )
 
         all_verts, all_faces, all_norms, all_uvs = [], [], [], []
