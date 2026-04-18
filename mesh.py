@@ -583,7 +583,46 @@ class Mesh:
 
         # uv_faces == faces: assimp gives per-vertex UVs after JoinIdenticalVertices
         uv_faces = faces.copy() if has_uvs else None
+
+        # For GLB/GLTF: pyassimp's embedded texture API is unreliable; use pygltflib instead
+        ext = filepath.rsplit('.', 1)[-1].lower()
+        if ext in ('glb', 'gltf') and not tex_preloaded and tex_paths:
+            tex_preloaded = Mesh._extract_gltf_textures(filepath)
+
         return vertices, faces, face_normals.astype(np.float64), normals, normal_faces, face_mats, uvs, uv_faces, tex_paths, tex_preloaded
+
+    @staticmethod
+    def _extract_gltf_textures(filepath):
+        """Extract embedded images from a GLB/GLTF file using pygltflib."""
+        try:
+            from pygltflib import GLTF2
+        except ImportError:
+            print("[Mesh] pygltflib not installed — run: pip install pygltflib")
+            return {}
+        import cv2, base64
+        result = {}
+        try:
+            gltf = GLTF2().load(filepath)
+            blob = gltf.binary_blob()  # raw bytes of the GLB binary chunk, or None
+            for i, image in enumerate(gltf.images):
+                key = f"*{i}"
+                try:
+                    raw = None
+                    if image.bufferView is not None and blob is not None:
+                        bv  = gltf.bufferViews[image.bufferView]
+                        raw = blob[bv.byteOffset: bv.byteOffset + bv.byteLength]
+                    elif image.uri and image.uri.startswith('data:'):
+                        raw = base64.b64decode(image.uri.split(',', 1)[1])
+                    if raw:
+                        buf = np.frombuffer(raw, dtype=np.uint8)
+                        img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+                        if img is not None:
+                            result[key] = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+                except Exception as e:
+                    print(f"[Mesh] Warning: gltf texture *{i} failed: {e}")
+        except Exception as e:
+            print(f"[Mesh] Warning: pygltflib load failed: {e}")
+        return result
 
     @staticmethod
     def _load_obj(filepath, scale, translate):
