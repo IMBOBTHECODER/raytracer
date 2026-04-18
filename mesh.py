@@ -445,21 +445,23 @@ class Mesh:
 
             # Extract embedded textures (path like "*0", "*1", ...)
             if hasattr(scene, 'textures') and scene.textures:
-                import cv2 as _cv2
+                import cv2 as _cv2, ctypes as _ct
                 for i, etex in enumerate(scene.textures):
                     key = f"*{i}"
                     try:
+                        addr = _ct.addressof(etex.data[0])
                         if etex.height == 0:
-                            # Compressed image data (PNG/JPG); etex.width == byte count
-                            raw = bytes(etex.data[:etex.width])
+                            # Compressed PNG/JPG; etex.width == byte count
+                            raw = _ct.string_at(addr, etex.width)
                             buf = np.frombuffer(raw, dtype=np.uint8)
                             img = _cv2.imdecode(buf, _cv2.IMREAD_COLOR)
                             if img is not None:
                                 tex_preloaded[key] = _cv2.cvtColor(img, _cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
                         else:
-                            # Raw BGRA8888
-                            n_px = etex.width * etex.height
-                            data = np.frombuffer(bytes(etex.data[:n_px * 4]), dtype=np.uint8).reshape(etex.height, etex.width, 4)
+                            # Raw BGRA8888: etex.width * etex.height texels, 4 bytes each
+                            n_bytes = etex.width * etex.height * 4
+                            raw = _ct.string_at(addr, n_bytes)
+                            data = np.frombuffer(raw, dtype=np.uint8).reshape(etex.height, etex.width, 4)
                             tex_preloaded[key] = data[:, :, [2, 1, 0]].astype(np.float32) / 255.0
                     except Exception as e:
                         print(f"[Mesh] Warning: embedded texture *{i} failed: {e}")
