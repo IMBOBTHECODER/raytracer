@@ -7,7 +7,7 @@ class Config:
     img_height = 1024
     aspect_ratio = img_width / img_height
 
-    lookfrom = np.array([10, 8.0, 10.0], dtype=np.float32)  # camera position
+    lookfrom = np.array([20.0, 8.0, 32.0], dtype=np.float32)  # camera position
     lookat   = np.array([0.0,  1.0, -2.0], dtype=np.float32)  # point camera is looking at
     vup = np.array([0.0, 1.0, 0.0],  dtype=np.float32)       # "up" direction for the camera
 

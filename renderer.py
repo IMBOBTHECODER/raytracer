@@ -69,9 +69,9 @@ def normalize(v):
 def background(direction):
     unit_direction = direction.normalized()
     t = 0.5 * (unit_direction[1] + 1.0)
-    white = tm.vec3(0.9, 0.9, 0.9)
-    warm  = tm.vec3(1.0, 0.945, 0.827)
-    return (1.0 - t) * white + t * warm
+    white = tm.vec3(1.0, 1.0, 1.0)
+    blue  = tm.vec3(0.5, 0.7, 1.0)
+    return (1.0 - t) * white + t * blue
 
 
 def apply_effect(linear: np.ndarray):
@@ -199,6 +199,62 @@ def random_unit_vec():
     return normalize(v)
 
 @ti.func
+def power_heuristic(pdf_a: ti.f32, pdf_b: ti.f32) -> ti.f32:
+    a2 = pdf_a * pdf_a
+    b2 = pdf_b * pdf_b
+    return a2 / (a2 + b2 + 1e-10)
+
+@ti.func
+def cosine_pdf(normal, scatter_dir) -> ti.f32:
+    return tm.max(0.0, tm.dot(normalize(scatter_dir), normal)) / tm.pi
+
+@ti.func
+def sphere_light_sample(sphere_idx, hit_point):
+    """Sample a direction toward sphere light. Returns (dir, pdf); pdf=0 on degenerate."""
+    center = sphere_center[sphere_idx]
+    radius = sphere_radius[sphere_idx]
+    to_center = center - hit_point
+    dist2 = to_center.norm_sqr()
+
+    light_dir = tm.vec3(0.0)
+    pdf = 0.0
+
+    if dist2 > radius * radius:
+        sin2_max = radius * radius / dist2
+        cos_max  = tm.sqrt(tm.max(0.0, 1.0 - sin2_max))
+        solid    = 2.0 * tm.pi * (1.0 - cos_max)
+        pdf      = 1.0 / solid
+
+        w = normalize(to_center)
+        up = tm.vec3(0.0, 1.0, 0.0)
+        if ti.abs(w[1]) > 0.9:
+            up = tm.vec3(1.0, 0.0, 0.0)
+        uu = normalize(tm.cross(up, w))
+        vv = tm.cross(w, uu)
+
+        r1 = ti.random()
+        r2 = ti.random()
+        cos_t = 1.0 - r1 * (1.0 - cos_max)
+        sin_t = tm.sqrt(tm.max(0.0, 1.0 - cos_t * cos_t))
+        phi   = 2.0 * tm.pi * r2
+        light_dir = normalize(sin_t * tm.cos(phi) * uu + sin_t * tm.sin(phi) * vv + cos_t * w)
+
+    return light_dir, pdf
+
+@ti.func
+def sphere_light_pdf(sphere_idx, from_point) -> ti.f32:
+    """Solid-angle PDF of the cone subtended by a sphere from from_point."""
+    center = sphere_center[sphere_idx]
+    radius = sphere_radius[sphere_idx]
+    dist2  = (center - from_point).norm_sqr()
+    pdf = 0.0
+    if dist2 > radius * radius:
+        cos_max = tm.sqrt(tm.max(0.0, 1.0 - radius * radius / dist2))
+        solid   = 2.0 * tm.pi * (1.0 - cos_max)
+        pdf     = 1.0 / solid
+    return pdf
+
+@ti.func
 def scatter(colour, material, metal_fuzz, refraction_index, ray_d, normal):
     """Material BRDF — takes raw material values, works for any object type."""
     scatter_dir = tm.vec3(0.0)
@@ -316,6 +372,8 @@ def scene_hit(ray_o, ray_d, t_min, t_max):
 def ray_colour(ray_o, ray_d):
     colour     = tm.vec3(0.0)
     throughput = tm.vec3(1.0)
+    prev_o     = ray_o   # scatter point from previous bounce (for MIS weight on emissive hits)
+    prev_bpdf  = -1.0    # BRDF pdf of previous scatter; -1 = camera ray or specular (skip MIS)
 
     for depth in range(Config.depth_limit):
         t, hit_type, obj_idx, u, v = scene_hit(ray_o, ray_d, 0.001, 1e30)
@@ -347,7 +405,6 @@ def ray_colour(ray_o, ray_d):
         mat_emit   = 0.0
 
         if hit_type == 0:  # triangle
-            # checkerboard for plane is not applicable — plain colour
             mat_colour = tri_colour[obj_idx]
             mat_type   = tri_material[obj_idx]
             mat_fuzz   = tri_metal_fuzz[obj_idx]
@@ -371,19 +428,49 @@ def ray_colour(ray_o, ray_d):
             mat_ior    = sphere_refraction_index[obj_idx]
             mat_emit   = sphere_emission[obj_idx]
 
-        # ── Scatter ──────────────────────────────────────────────────────────
+        # ── Emissive / Absorbing ──────────────────────────────────────────────
+        if mat_type == 3 or mat_type == 4:
+            if mat_type == 3:
+                if hit_type == 2 and prev_bpdf > 0.0:
+                    # Sphere emitter reached via BRDF: weight against its NEE counterpart
+                    lpdf = sphere_light_pdf(obj_idx, prev_o)
+                    w    = power_heuristic(prev_bpdf, lpdf)
+                    colour += throughput * mat_colour * mat_emit * w
+                else:
+                    # Triangle emitter, camera ray, or after specular — no NEE counterpart
+                    colour += throughput * mat_colour * mat_emit
+            break
+
+        # ── Direct light sampling (NEE) — diffuse surfaces only ──────────────
+        if mat_type == 0:
+            for si in range(n_spheres):
+                if sphere_material[si] == 3:
+                    light_dir, lpdf = sphere_light_sample(si, hit_point)
+                    if lpdf > 0.0:
+                        cos_t = tm.dot(light_dir, normal)
+                        if cos_t > 0.0:
+                            sh_t, sh_type, sh_idx, _, _ = scene_hit(hit_point, light_dir, 0.001, 1e30)
+                            if sh_type == 2 and sh_idx == si:  # unoccluded path to light
+                                brdf_pdf = cos_t / tm.pi
+                                w        = power_heuristic(lpdf, brdf_pdf)
+                                colour  += throughput * (mat_colour / tm.pi) * cos_t \
+                                           * sphere_colour[si] * sphere_emission[si] * w / lpdf
+
+        # ── BRDF scatter ──────────────────────────────────────────────────────
         scatter_dir, attenuation, did_scatter = scatter(
             mat_colour, mat_type, mat_fuzz, mat_ior, ray_d, normal
         )
 
         if not did_scatter:
-            # emissive: add light; absorbing: add black
-            colour += throughput * mat_colour * mat_emit
             break
 
+        bpdf = cosine_pdf(normal, scatter_dir) if mat_type == 0 else -1.0
+
         throughput *= attenuation
-        ray_o = hit_point
-        ray_d = normalize(scatter_dir)
+        prev_o    = hit_point
+        prev_bpdf = bpdf
+        ray_o     = hit_point
+        ray_d     = normalize(scatter_dir)
 
     return colour
 
