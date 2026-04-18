@@ -37,11 +37,13 @@ def _map_material(mat):
 class Triangle:
     """A single triangle primitive. Stores geometry and material for GPU upload."""
     __slots__ = ('v0', 'v1', 'v2', '_normal', 'n0', 'n1', 'n2',
-                 'colour', 'material', 'metal_fuzz', 'emission_intensity', 'refraction_index')
+                 'colour', 'material', 'metal_fuzz', 'emission_intensity', 'refraction_index',
+                 'uv0', 'uv1', 'uv2', 'tex_id')
 
     def __init__(self, v0, v1, v2, normal,
                  colour, material, metal_fuzz, emission_intensity, refraction_index,
-                 n0=None, n1=None, n2=None):
+                 n0=None, n1=None, n2=None,
+                 uv0=None, uv1=None, uv2=None, tex_id=-1):
         self.v0, self.v1, self.v2 = v0, v1, v2
         self._normal = normal
         self.n0, self.n1, self.n2 = n0, n1, n2
@@ -50,6 +52,11 @@ class Triangle:
         self.metal_fuzz = metal_fuzz
         self.emission_intensity = emission_intensity
         self.refraction_index = refraction_index
+        _z2 = np.zeros(2, dtype=np.float32)
+        self.uv0 = uv0 if uv0 is not None else _z2
+        self.uv1 = uv1 if uv1 is not None else _z2
+        self.uv2 = uv2 if uv2 is not None else _z2
+        self.tex_id = tex_id
 
 
 def _box_sa(bmin: np.ndarray, bmax: np.ndarray) -> float:
@@ -126,7 +133,7 @@ class BVHNode:
     @classmethod
     def build_parallel(cls, vertices, faces, face_normals, normals, normal_faces, num_workers,
                        colour, material, metal_fuzz, emission_intensity, refraction_index,
-                       face_mats=None):
+                       face_mats=None, uvs=None, uv_faces=None, face_tex_ids=None):
         print(f"[BVH] Splitting {len(faces):,} triangles into {num_workers} chunks...")
 
         centroids = (vertices[faces[:, 0]] + vertices[faces[:, 1]] + vertices[faces[:, 2]]) / 3.0
@@ -135,8 +142,10 @@ class BVHNode:
         order     = np.argsort(centroids[:, axis])
         sorted_faces        = faces[order]
         sorted_face_normals = face_normals[order]
-        sorted_normal_faces = normal_faces[order] if normal_faces is not None else None
+        sorted_normal_faces = normal_faces[order]  if normal_faces  is not None else None
         sorted_face_mats    = {k: v[order] for k, v in face_mats.items()} if face_mats is not None else None
+        sorted_uv_faces     = uv_faces[order]      if uv_faces      is not None else None
+        sorted_face_tex_ids = face_tex_ids[order]  if face_tex_ids  is not None else None
 
         size = len(sorted_faces) // num_workers
         def chunk(arr, i):
@@ -151,9 +160,12 @@ class BVHNode:
              chunk(sorted_faces, i),
              chunk(sorted_face_normals, i),
              normals,
-             chunk(sorted_normal_faces, i) if sorted_normal_faces is not None else None,
+             chunk(sorted_normal_faces, i)  if sorted_normal_faces  is not None else None,
              colour, material, metal_fuzz, emission_intensity, refraction_index,
-             {k: chunk(v, i) for k, v in sorted_face_mats.items()} if sorted_face_mats is not None else None)
+             {k: chunk(v, i) for k, v in sorted_face_mats.items()} if sorted_face_mats is not None else None,
+             uvs,
+             chunk(sorted_uv_faces, i)     if sorted_uv_faces     is not None else None,
+             chunk(sorted_face_tex_ids, i) if sorted_face_tex_ids is not None else None)
             for i in range(num_workers)
         ]
 
@@ -172,9 +184,11 @@ class BVHNode:
 
 
 def _build_bvh_subtree(args):
-    vertices, face_chunk, fn_chunk, normals, normal_face_chunk, colour, material, metal_fuzz, emission_intensity, refraction_index, face_mats = args
+    vertices, face_chunk, fn_chunk, normals, normal_face_chunk, colour, material, metal_fuzz, \
+    emission_intensity, refraction_index, face_mats, uvs, uv_face_chunk, face_tex_id_chunk = args
     n = len(face_chunk)
     triangles = [None] * n
+    _z2 = np.zeros(2, dtype=np.float32)
     for i in range(n):
         f  = face_chunk[i]
         n0 = n1 = n2 = None
@@ -182,7 +196,6 @@ def _build_bvh_subtree(args):
             nf = normal_face_chunk[i]
             if nf[0] >= 0 and nf[1] >= 0 and nf[2] >= 0:
                 n0, n1, n2 = normals[nf[0]], normals[nf[1]], normals[nf[2]]
-        # Use per-face FBX materials if available, else fall back to scalar params
         if face_mats is not None:
             c  = face_mats['colour'][i]
             m  = face_mats['material'][i]
@@ -191,11 +204,20 @@ def _build_bvh_subtree(args):
             em = float(face_mats['emission'][i])
         else:
             c, m, fz, ir, em = colour, material, metal_fuzz, refraction_index, emission_intensity
+        if uvs is not None and uv_face_chunk is not None:
+            uf  = uv_face_chunk[i]
+            uv0 = uvs[uf[0]].astype(np.float32) if uf[0] >= 0 else _z2
+            uv1 = uvs[uf[1]].astype(np.float32) if uf[1] >= 0 else _z2
+            uv2 = uvs[uf[2]].astype(np.float32) if uf[2] >= 0 else _z2
+        else:
+            uv0 = uv1 = uv2 = _z2
+        tex_id = int(face_tex_id_chunk[i]) if face_tex_id_chunk is not None else -1
         triangles[i] = Triangle(
             vertices[f[0]], vertices[f[1]], vertices[f[2]], fn_chunk[i],
             colour=c, material=m, metal_fuzz=fz,
             emission_intensity=em, refraction_index=ir,
             n0=n0, n1=n1, n2=n2,
+            uv0=uv0, uv1=uv1, uv2=uv2, tex_id=tex_id,
         )
     return BVHNode(triangles)
 
@@ -204,50 +226,75 @@ class Mesh:
     def __init__(self, filepath: str, colour: np.ndarray, material=None,
                  metal_fuzz=0.0, emission_intensity=5.0, refraction_index=1.5,
                  scale=1.0, translate=None, ignore_fbx_materials=False):
-        self.colour = colour
+        import os, cv2
+        self.colour   = colour
         self.material = material
 
-        vertices, faces, face_normals, normals, normal_faces, face_mats = self._load_file(
-            filepath, scale, np.zeros(3) if translate is None else translate,
-        )
+        vertices, faces, face_normals, normals, normal_faces, face_mats, uvs, uv_faces, tex_paths = \
+            self._load_file(filepath, scale, np.zeros(3) if translate is None else translate)
+
+        # Load texture images
+        basedir = os.path.dirname(os.path.abspath(filepath))
+        self.textures = []
+        _white = np.ones((1, 1, 3), dtype=np.float32)
+        for p in (tex_paths or []):
+            full = p if os.path.isabs(p) else os.path.join(basedir, p)
+            img  = cv2.imread(full) if os.path.exists(full) else None
+            if img is not None:
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+            else:
+                img = _white
+                print(f"[Mesh] Warning: texture not found: {full!r} — using white fallback")
+            self.textures.append(img)
+
+        # Per-face texture IDs
+        n_faces = len(faces)
+        if face_mats is not None and 'tex_id' in face_mats:
+            face_tex_ids = face_mats['tex_id'].astype(np.int32)
+        elif tex_paths:
+            face_tex_ids = np.zeros(n_faces, dtype=np.int32)
+        else:
+            face_tex_ids = np.full(n_faces, -1, dtype=np.int32)
+
         smooth = normal_faces is not None
-        print(f"[Mesh] {filepath}: {len(faces):,} triangles ({'smooth' if smooth else 'flat'} normals)")
+        print(f"[Mesh] {filepath}: {len(faces):,} triangles ({'smooth' if smooth else 'flat'} normals), "
+              f"{len([t for t in self.textures if t is not None])} texture(s)")
+
         self.bvh = BVHNode.build_parallel(
             vertices, faces, face_normals, normals, normal_faces, Config.num_workers,
             colour=colour, material=material, metal_fuzz=metal_fuzz,
             emission_intensity=emission_intensity, refraction_index=refraction_index,
             face_mats=None if ignore_fbx_materials else face_mats,
+            uvs=uvs, uv_faces=uv_faces, face_tex_ids=face_tex_ids,
         )
 
     @staticmethod
     def _parse_faces(lines):
         """
-        Parse face lines. Tries a fast vectorized path for uniform meshes
-        (all tri or all quad, same component format). Falls back to a Python loop.
-        Returns (faces, normal_faces) as int32 arrays; normal_faces is None if absent.
+        Parse face lines. Returns (faces, normal_faces, uv_faces) as int32 arrays;
+        normal_faces and uv_faces are None if absent.
         """
         face_lines = [l for l in lines if len(l) > 2 and l[0] == 'f' and l[1] == ' ']
         if not face_lines:
-            return np.zeros((0, 3), dtype=np.int32), None
+            return np.zeros((0, 3), dtype=np.int32), None, None
 
-        # Detect format from first line
         sample = face_lines[0].split()[1:]
         n_verts = len(sample)
 
         if n_verts in (3, 4):
             sv = sample[0]
             if '//' in sv:
-                fmt, norm_col, comps = 'double_slash', 2, 3
+                fmt, norm_col, uv_col, comps = 'double_slash', 2, -1, 3
             elif '/' in sv:
                 parts = sv.split('/')
                 comps = len(parts)
                 fmt = 'slash'
                 norm_col = 2 if comps >= 3 else -1
+                uv_col   = 1 if comps >= 2 else -1
             else:
-                fmt, norm_col, comps = 'pos_only', -1, 1
+                fmt, norm_col, uv_col, comps = 'pos_only', -1, -1, 1
 
             try:
-                # Build one big string and parse all indices at once
                 text = ' '.join(l[2:] for l in face_lines)
                 if fmt == 'double_slash':
                     text = text.replace('//', ' 0 ')
@@ -259,51 +306,78 @@ class Mesh:
 
                 pos = data[:, :, 0]
                 nrm = data[:, :, norm_col] if norm_col >= 0 else None
+                uvf = data[:, :, uv_col]   if uv_col  >= 0 else None
 
                 if n_verts == 3:
-                    faces = pos.astype(np.int32)
+                    faces        = pos.astype(np.int32)
                     normal_faces = nrm.astype(np.int32) if nrm is not None else None
-                else:  # quad → 2 triangles
-                    faces = np.concatenate([pos[:, [0,1,2]], pos[:, [0,2,3]]], axis=0).astype(np.int32)
-                    if nrm is not None:
-                        normal_faces = np.concatenate([nrm[:, [0,1,2]], nrm[:, [0,2,3]]], axis=0).astype(np.int32)
-                    else:
-                        normal_faces = None
+                    uv_faces     = uvf.astype(np.int32) if uvf is not None else None
+                else:
+                    faces        = np.concatenate([pos[:, [0,1,2]], pos[:, [0,2,3]]], axis=0).astype(np.int32)
+                    normal_faces = np.concatenate([nrm[:, [0,1,2]], nrm[:, [0,2,3]]], axis=0).astype(np.int32) if nrm is not None else None
+                    uv_faces     = np.concatenate([uvf[:, [0,1,2]], uvf[:, [0,2,3]]], axis=0).astype(np.int32) if uvf is not None else None
 
                 has_normals = normal_faces is not None and np.any(normal_faces >= 0)
-                return faces, (normal_faces if has_normals else None)
+                has_uvs     = uv_faces     is not None and np.any(uv_faces     >= 0)
+                return faces, (normal_faces if has_normals else None), (uv_faces if has_uvs else None)
 
             except (ValueError, IndexError):
-                pass  # fall through to Python loop
+                pass
 
-        # Fallback: Python loop handles mixed polygon counts and unusual formats
-        face_list, normal_face_list = [], []
-        has_normals = False
+        face_list, normal_face_list, uv_face_list = [], [], []
+        has_normals = has_uvs = False
         for line in face_lines:
             parts = line.split()[1:]
-            pos_idx, norm_idx = [], []
+            pos_idx, norm_idx, uv_idx = [], [], []
             for p in parts:
                 comp = p.split('/')
                 pos_idx.append(int(comp[0]) - 1)
+                if len(comp) >= 2 and comp[1]:
+                    uv_idx.append(int(comp[1]) - 1);  has_uvs = True
+                else:
+                    uv_idx.append(-1)
                 if len(comp) >= 3 and comp[2]:
-                    norm_idx.append(int(comp[2]) - 1)
-                    has_normals = True
+                    norm_idx.append(int(comp[2]) - 1);  has_normals = True
                 else:
                     norm_idx.append(-1)
             for i in range(1, len(pos_idx) - 1):
-                face_list.append((pos_idx[0], pos_idx[i], pos_idx[i + 1]))
-                normal_face_list.append((norm_idx[0], norm_idx[i], norm_idx[i + 1]))
+                face_list.append((pos_idx[0], pos_idx[i], pos_idx[i+1]))
+                normal_face_list.append((norm_idx[0], norm_idx[i], norm_idx[i+1]))
+                uv_face_list.append((uv_idx[0], uv_idx[i], uv_idx[i+1]))
 
-        faces = np.array(face_list, dtype=np.int32)
+        faces        = np.array(face_list,        dtype=np.int32)
         normal_faces = np.array(normal_face_list, dtype=np.int32) if has_normals else None
-        return faces, normal_faces
+        uv_faces     = np.array(uv_face_list,     dtype=np.int32) if has_uvs     else None
+        return faces, normal_faces, uv_faces
+
+    @staticmethod
+    def _parse_mtl(obj_path, mtllib_name):
+        """Returns {mat_name: tex_path} from a .mtl file next to the .obj."""
+        import os
+        mtl_path = os.path.join(os.path.dirname(os.path.abspath(obj_path)), mtllib_name.strip())
+        result = {}
+        current = None
+        try:
+            with open(mtl_path) as f:
+                for line in f:
+                    parts = line.strip().split(None, 1)
+                    if not parts:
+                        continue
+                    if parts[0] == 'newmtl' and len(parts) > 1:
+                        current = parts[1].strip()
+                    elif parts[0] in ('map_Kd', 'map_kd') and current and len(parts) > 1:
+                        result[current] = parts[1].strip()
+        except FileNotFoundError:
+            pass
+        return result
 
     @staticmethod
     def _load_file(filepath, scale, translate):
         ext = filepath.rsplit('.', 1)[-1].lower()
         if ext == 'obj':
-            result = Mesh._load_obj(filepath, scale, translate)
-            return result + (None,)   # no per-face materials for OBJ
+            vertices, faces, face_normals, normals, normal_faces, uvs, uv_faces, tex_paths = \
+                Mesh._load_obj(filepath, scale, translate)
+            return vertices, faces, face_normals, normals, normal_faces, None, uvs, uv_faces, tex_paths
         return Mesh._load_assimp(filepath, scale, translate)
 
     @staticmethod
@@ -317,45 +391,71 @@ class Mesh:
             pp.aiProcess_JoinIdenticalVertices
         )
 
-        all_verts, all_faces, all_norms = [], [], []
-        all_colours, all_materials, all_fuzz, all_ior, all_emission = [], [], [], [], []
+        all_verts, all_faces, all_norms, all_uvs = [], [], [], []
+        all_colours, all_materials, all_fuzz, all_ior, all_emission, all_tex_ids = [], [], [], [], [], []
+        tex_paths = []
+        path_to_id = {}
         vert_offset = 0
+        has_uvs = False
 
         with pyassimp.load(filepath, processing=processing) as scene:
             if not scene.meshes:
                 raise ValueError(f"No meshes found in {filepath}")
 
-            for m in scene.meshes:
-                verts = np.array(m.vertices, dtype=np.float64)
-                faces = np.array(m.faces,    dtype=np.int32) + vert_offset
-                norms = np.array(m.normals,  dtype=np.float64)
-                n_faces = len(faces)
+            # Build texture path list from all materials upfront
+            for mat in scene.materials:
+                for (name, sem, _), val in mat.properties.items():
+                    if '$tex.file' in name and sem == 1 and isinstance(val, str) and val not in path_to_id:
+                        path_to_id[val] = len(tex_paths)
+                        tex_paths.append(val)
 
-                mat = scene.materials[m.materialindex]
+            for m in scene.meshes:
+                verts   = np.array(m.vertices, dtype=np.float64)
+                faces_m = np.array(m.faces,    dtype=np.int32) + vert_offset
+                norms   = np.array(m.normals,  dtype=np.float64)
+                n_verts = len(verts)
+                n_faces = len(faces_m)
+
+                mat     = scene.materials[m.materialindex]
                 mat_str, colour, fuzz, ior, emission = _map_material(mat)
 
+                # Per-vertex UVs (channel 0)
+                if m.texturecoords is not None and len(m.texturecoords) > 0 \
+                        and m.texturecoords[0] is not None and len(m.texturecoords[0]) == n_verts:
+                    uvs_m    = np.array(m.texturecoords[0], dtype=np.float64)[:, :2]
+                    has_uvs  = True
+                else:
+                    uvs_m = np.zeros((n_verts, 2), dtype=np.float64)
+
+                # Texture ID for this submesh's material
+                tex_id_m = -1
+                for (name, sem, _), val in mat.properties.items():
+                    if '$tex.file' in name and sem == 1 and isinstance(val, str):
+                        tex_id_m = path_to_id.get(val, -1)
+                        break
+
                 all_verts.append(verts)
-                all_faces.append(faces)
+                all_faces.append(faces_m)
                 all_norms.append(norms)
+                all_uvs.append(uvs_m)
                 all_colours.append(np.tile(colour, (n_faces, 1)))
-                all_materials.append(np.full(n_faces, mat_str,  dtype=object))
-                all_fuzz.append(    np.full(n_faces, fuzz,      dtype=np.float64))
-                all_ior.append(     np.full(n_faces, ior,       dtype=np.float64))
-                all_emission.append(np.full(n_faces, emission,  dtype=np.float64))
-                vert_offset += len(verts)
+                all_materials.append(np.full(n_faces, mat_str,   dtype=object))
+                all_fuzz.append(     np.full(n_faces, fuzz,      dtype=np.float64))
+                all_ior.append(      np.full(n_faces, ior,       dtype=np.float64))
+                all_emission.append( np.full(n_faces, emission,  dtype=np.float64))
+                all_tex_ids.append(  np.full(n_faces, tex_id_m,  dtype=np.int32))
+                vert_offset += n_verts
 
         vertices = np.concatenate(all_verts, axis=0) * scale + translate
         faces    = np.concatenate(all_faces, axis=0)
         normals  = np.concatenate(all_norms, axis=0)
+        uvs      = np.concatenate(all_uvs,   axis=0) if has_uvs else None
 
-        # Normalize vertex normals
         lens = np.linalg.norm(normals, axis=1, keepdims=True)
         normals = normals / np.where(lens > 0, lens, 1.0)
 
-        # normal_faces == faces (assimp gives per-vertex normals)
-        normal_faces = faces.copy()
+        normal_faces = faces.copy()  # assimp gives per-vertex normals; UV faces are same
 
-        # Flat face normals for BVH construction
         e1 = vertices[faces[:, 1]] - vertices[faces[:, 0]]
         e2 = vertices[faces[:, 2]] - vertices[faces[:, 0]]
         crosses = np.cross(e1, e2)
@@ -363,14 +463,17 @@ class Mesh:
         face_normals = crosses / np.where(lens > 1e-12, lens, 1.0)
 
         face_mats = {
-            'colour':   np.concatenate(all_colours,  axis=0).astype(np.float64),
-            'material': np.concatenate(all_materials, axis=0),  # object array of strings/None
-            'fuzz':     np.concatenate(all_fuzz,     axis=0),
-            'ior':      np.concatenate(all_ior,      axis=0),
-            'emission': np.concatenate(all_emission, axis=0),
+            'colour':   np.concatenate(all_colours,   axis=0).astype(np.float64),
+            'material': np.concatenate(all_materials, axis=0),
+            'fuzz':     np.concatenate(all_fuzz,      axis=0),
+            'ior':      np.concatenate(all_ior,        axis=0),
+            'emission': np.concatenate(all_emission,  axis=0),
+            'tex_id':   np.concatenate(all_tex_ids,   axis=0),
         }
 
-        return vertices, faces, face_normals.astype(np.float64), normals, normal_faces, face_mats
+        # uv_faces == faces: assimp gives per-vertex UVs after JoinIdenticalVertices
+        uv_faces = faces.copy() if has_uvs else None
+        return vertices, faces, face_normals.astype(np.float64), normals, normal_faces, face_mats, uvs, uv_faces, tex_paths
 
     @staticmethod
     def _load_obj(filepath, scale, translate):
@@ -378,13 +481,21 @@ class Mesh:
         with open(filepath) as fh:
             lines = fh.readlines()
 
-        # ── Vertices (vectorized) ────────────────────────────────────────────
+        # ── Vertices ─────────────────────────────────────────────────────────
         print(f"[Mesh] Parsing vertices...")
         v_data = ' '.join(l[2:] for l in lines if len(l) > 2 and l[0] == 'v' and l[1] == ' ')
         vertices = np.fromstring(v_data, sep=' ', dtype=np.float64).reshape(-1, 3)
         vertices = vertices * scale + translate
 
-        # ── Vertex normals (vectorized) ──────────────────────────────────────
+        # ── UV coordinates ───────────────────────────────────────────────────
+        vt_lines = [l for l in lines if len(l) > 3 and l[:2] == 'vt']
+        if vt_lines:
+            vt_data = ' '.join(l[3:] for l in vt_lines)
+            uvs = np.fromstring(vt_data, sep=' ', dtype=np.float64).reshape(-1, -1)[:, :2]
+        else:
+            uvs = None
+
+        # ── Vertex normals ───────────────────────────────────────────────────
         vn_lines = [l for l in lines if len(l) > 3 and l[:2] == 'vn']
         if vn_lines:
             vn_data = ' '.join(l[3:] for l in vn_lines)
@@ -396,13 +507,21 @@ class Mesh:
 
         # ── Faces ────────────────────────────────────────────────────────────
         print(f"[Mesh] Parsing faces...")
-        faces, normal_faces = Mesh._parse_faces(lines)
+        faces, normal_faces, uv_faces = Mesh._parse_faces(lines)
 
-        # ── Face normals (vectorized — avoids per-triangle normalize() calls) ─
+        # ── Face normals ─────────────────────────────────────────────────────
         e1 = vertices[faces[:, 1]] - vertices[faces[:, 0]]
         e2 = vertices[faces[:, 2]] - vertices[faces[:, 0]]
         crosses = np.cross(e1, e2)
         norms = np.linalg.norm(crosses, axis=1, keepdims=True)
         face_normals = crosses / np.where(norms > 1e-12, norms, 1.0)
 
-        return vertices, faces, face_normals.astype(np.float64), normals, normal_faces
+        # ── MTL texture paths ────────────────────────────────────────────────
+        tex_paths = []
+        for l in lines:
+            if l.startswith('mtllib') and len(l.split()) > 1:
+                mat_tex = Mesh._parse_mtl(filepath, l.split(None, 1)[1])
+                tex_paths = list(dict.fromkeys(mat_tex.values()))
+                break
+
+        return vertices, faces, face_normals.astype(np.float64), normals, normal_faces, uvs, uv_faces, tex_paths

@@ -20,6 +20,14 @@ tri_n0              = None
 tri_n1              = None
 tri_n2              = None
 tri_has_smooth      = None
+tri_uv0             = None
+tri_uv1             = None
+tri_uv2             = None
+tri_tex_id          = None
+
+tex_atlas  = None
+n_textures = 0
+TEX_SIZE   = 512
 
 # BVH node fields (populated by build())
 bvh_bbox_min  = None  # vec3 per node — AABB min corner
@@ -197,6 +205,22 @@ def random_unit_vec():
         if v.norm_sqr() <= 1.0:
             break
     return normalize(v)
+
+@ti.func
+def sample_texture(tex_id, uv):
+    u  = uv[0] % 1.0
+    v  = 1.0 - (uv[1] % 1.0)  # flip V: UV origin is bottom-left, image origin is top-left
+    x  = u * (TEX_SIZE - 1)
+    y  = v * (TEX_SIZE - 1)
+    x0 = int(x);  x1 = min(x0 + 1, TEX_SIZE - 1)
+    y0 = int(y);  y1 = min(y0 + 1, TEX_SIZE - 1)
+    fx = x - float(x0)
+    fy = y - float(y0)
+    c00 = tex_atlas[tex_id, y0, x0]
+    c10 = tex_atlas[tex_id, y0, x1]
+    c01 = tex_atlas[tex_id, y1, x0]
+    c11 = tex_atlas[tex_id, y1, x1]
+    return (1.0-fx)*(1.0-fy)*c00 + fx*(1.0-fy)*c10 + (1.0-fx)*fy*c01 + fx*fy*c11
 
 @ti.func
 def sphere_light_sample(sphere_idx, hit_point):
@@ -382,7 +406,12 @@ def ray_colour(ray_o, ray_d):
         mat_emit   = 0.0
 
         if hit_type == 0:  # triangle
-            mat_colour = tri_colour[obj_idx]
+            tid = tri_tex_id[obj_idx]
+            if tid >= 0:
+                uv = tri_uv0[obj_idx] * (1.0 - u - v) + tri_uv1[obj_idx] * u + tri_uv2[obj_idx] * v
+                mat_colour = sample_texture(tid, uv)
+            else:
+                mat_colour = tri_colour[obj_idx]
             mat_type   = tri_material[obj_idx]
             mat_fuzz   = tri_metal_fuzz[obj_idx]
             mat_ior    = tri_refraction_index[obj_idx]
@@ -521,14 +550,10 @@ def render():
         framebuffer[j, i] /= antialising_samples  # average the samples for anti-aliasing
 
 
-def gather_triangles(scene):
-    """Walk the scene and collect all Triangle objects into a flat list."""
-    from mesh import BVHNode
+def _collect_obj_tris(obj):
+    """Collect triangles from a single mesh object's BVH."""
     tris = []
-    stack = []
-    for obj in scene.objects:
-        if hasattr(obj, 'bvh'):
-            stack.append(obj.bvh)
+    stack = [obj.bvh]
     while stack:
         node = stack.pop()
         if node.is_leaf:
@@ -538,6 +563,15 @@ def gather_triangles(scene):
         else:
             stack.append(node.left)
             stack.append(node.right)
+    return tris
+
+
+def gather_triangles(scene):
+    """Walk the scene and collect all Triangle objects into a flat list."""
+    tris = []
+    for obj in scene.objects:
+        if hasattr(obj, 'bvh'):
+            tris.extend(_collect_obj_tris(obj))
     return tris
 
 
@@ -608,6 +642,8 @@ def build(scene):
     global tri_v0, tri_v1, tri_v2, tri_colour, tri_material
     global tri_metal_fuzz, tri_refraction_index, tri_emission
     global tri_normal, tri_n0, tri_n1, tri_n2, tri_has_smooth
+    global tri_uv0, tri_uv1, tri_uv2, tri_tex_id
+    global tex_atlas, n_textures
     global bvh_bbox_min, bvh_bbox_max, bvh_left, bvh_right
     global bvh_tri_start, bvh_tri_end, bvh_tri_indices
     global plane_point, plane_normal, plane_colour, plane_material
@@ -637,6 +673,37 @@ def build(scene):
     n1_np = np.array([t.n1 if t.n1 is not None else t._normal for t in all_tris], dtype=np.float32)
     n2_np = np.array([t.n2 if t.n2 is not None else t._normal for t in all_tris], dtype=np.float32)
 
+    _z2 = np.zeros(2, dtype=np.float32)
+    uv0_np    = np.array([t.uv0    if hasattr(t, 'uv0') else _z2 for t in all_tris], dtype=np.float32)
+    uv1_np    = np.array([t.uv1    if hasattr(t, 'uv1') else _z2 for t in all_tris], dtype=np.float32)
+    uv2_np    = np.array([t.uv2    if hasattr(t, 'uv2') else _z2 for t in all_tris], dtype=np.float32)
+    tex_id_np = np.array([t.tex_id if hasattr(t, 'tex_id') else -1 for t in all_tris], dtype=np.int32)
+
+    # ── Collect textures; remap per-mesh local tex_ids to global atlas ───────
+    all_textures = []
+    for obj in scene.objects:
+        if hasattr(obj, 'textures') and obj.textures:
+            all_textures.extend(obj.textures)
+    n_textures = len(all_textures)
+
+    # Rebuild tex_id_np with global offsets by tracking which object each tri belongs to
+    global_offset = 0
+    tex_id_np_remapped = tex_id_np.copy()
+    i = 0
+    for obj in scene.objects:
+        if not hasattr(obj, 'bvh'):
+            global_offset += len(getattr(obj, 'textures', []))
+            continue
+        obj_tris = _collect_obj_tris(obj)
+        n_obj = len(obj_tris)
+        obj_offset = global_offset
+        if obj_offset > 0:
+            mask = tex_id_np_remapped[i:i + n_obj] >= 0
+            tex_id_np_remapped[i:i + n_obj][mask] += obj_offset
+        i += n_obj
+        global_offset += len(getattr(obj, 'textures', []))
+    tex_id_np = tex_id_np_remapped
+
     # ── Build flat BVH ───────────────────────────────────────────────────────
     print(f"[Build] Building BVH...")
     bmin_np, bmax_np, left_np, right_np, ts_np, te_np, tidx_np = _build_flat_bvh(v0_np, v1_np, v2_np)
@@ -657,6 +724,20 @@ def build(scene):
     tri_n1               = ti.Vector.field(3, dtype=ti.f32, shape=n)
     tri_n2               = ti.Vector.field(3, dtype=ti.f32, shape=n)
     tri_has_smooth       = ti.field(dtype=ti.i32, shape=n)
+    tri_uv0              = ti.Vector.field(2, dtype=ti.f32, shape=n)
+    tri_uv1              = ti.Vector.field(2, dtype=ti.f32, shape=n)
+    tri_uv2              = ti.Vector.field(2, dtype=ti.f32, shape=n)
+    tri_tex_id           = ti.field(dtype=ti.i32, shape=n)
+
+    # ── Allocate texture atlas ───────────────────────────────────────────────
+    atlas_count = max(n_textures, 1)
+    tex_atlas = ti.Vector.field(3, dtype=ti.f32, shape=(atlas_count, TEX_SIZE, TEX_SIZE))
+    if n_textures > 0:
+        atlas_np = np.zeros((n_textures, TEX_SIZE, TEX_SIZE, 3), dtype=np.float32)
+        for ti_idx, img in enumerate(all_textures):
+            resized = cv2.resize(img, (TEX_SIZE, TEX_SIZE), interpolation=cv2.INTER_LINEAR)
+            atlas_np[ti_idx] = resized
+        tex_atlas.from_numpy(atlas_np)
 
     # ── Allocate BVH fields ──────────────────────────────────────────────────
     bvh_bbox_min    = ti.Vector.field(3, dtype=ti.f32, shape=n_nodes)
@@ -680,6 +761,10 @@ def build(scene):
     tri_n0.from_numpy(n0_np)
     tri_n1.from_numpy(n1_np)
     tri_n2.from_numpy(n2_np)
+    tri_uv0.from_numpy(uv0_np)
+    tri_uv1.from_numpy(uv1_np)
+    tri_uv2.from_numpy(uv2_np)
+    tri_tex_id.from_numpy(tex_id_np)
 
     # ── Fill BVH fields (bulk upload via numpy) ──────────────────────────────
     bvh_bbox_min.from_numpy(bmin_np)
@@ -771,6 +856,12 @@ def save_scene(path):
         tri_n1               = tri_n1.to_numpy(),
         tri_n2               = tri_n2.to_numpy(),
         tri_has_smooth       = tri_has_smooth.to_numpy(),
+        tri_uv0              = tri_uv0.to_numpy(),
+        tri_uv1              = tri_uv1.to_numpy(),
+        tri_uv2              = tri_uv2.to_numpy(),
+        tri_tex_id           = tri_tex_id.to_numpy(),
+        n_textures           = np.array(n_textures),
+        tex_atlas            = tex_atlas.to_numpy(),
         # BVH
         bvh_bbox_min    = bvh_bbox_min.to_numpy(),
         bvh_bbox_max    = bvh_bbox_max.to_numpy(),
@@ -806,6 +897,8 @@ def load_scene(path):
     global tri_v0, tri_v1, tri_v2, tri_colour, tri_material
     global tri_metal_fuzz, tri_refraction_index, tri_emission
     global tri_normal, tri_n0, tri_n1, tri_n2, tri_has_smooth
+    global tri_uv0, tri_uv1, tri_uv2, tri_tex_id
+    global tex_atlas, n_textures
     global bvh_bbox_min, bvh_bbox_max, bvh_left, bvh_right
     global bvh_tri_start, bvh_tri_end, bvh_tri_indices
     global plane_point, plane_normal, plane_colour, plane_material
@@ -830,6 +923,10 @@ def load_scene(path):
     tri_n1               = ti.Vector.field(3, dtype=ti.f32, shape=n)
     tri_n2               = ti.Vector.field(3, dtype=ti.f32, shape=n)
     tri_has_smooth       = ti.field(dtype=ti.i32, shape=n)
+    tri_uv0              = ti.Vector.field(2, dtype=ti.f32, shape=n)
+    tri_uv1              = ti.Vector.field(2, dtype=ti.f32, shape=n)
+    tri_uv2              = ti.Vector.field(2, dtype=ti.f32, shape=n)
+    tri_tex_id           = ti.field(dtype=ti.i32, shape=n)
 
     tri_v0.from_numpy(d['tri_v0'])
     tri_v1.from_numpy(d['tri_v1'])
@@ -844,6 +941,16 @@ def load_scene(path):
     tri_n1.from_numpy(d['tri_n1'])
     tri_n2.from_numpy(d['tri_n2'])
     tri_has_smooth.from_numpy(d['tri_has_smooth'])
+    tri_uv0.from_numpy(d['tri_uv0'])
+    tri_uv1.from_numpy(d['tri_uv1'])
+    tri_uv2.from_numpy(d['tri_uv2'])
+    tri_tex_id.from_numpy(d['tri_tex_id'])
+
+    n_textures = int(d['n_textures'])
+    atlas_data = d['tex_atlas']
+    atlas_count = max(n_textures, 1)
+    tex_atlas = ti.Vector.field(3, dtype=ti.f32, shape=(atlas_count, TEX_SIZE, TEX_SIZE))
+    tex_atlas.from_numpy(atlas_data)
 
     nn = len(d['bvh_bbox_min'])
     bvh_bbox_min    = ti.Vector.field(3, dtype=ti.f32, shape=nn)
