@@ -447,13 +447,16 @@ class Mesh:
                         tex_paths.append(val)
 
             # Build world transform per mesh by walking the node tree
+            mesh_ptr_to_idx = {id(m): i for i, m in enumerate(scene.meshes)}
             mesh_transforms = [np.eye(4)] * len(scene.meshes)
             node_stack = [(scene.rootnode, np.eye(4))]
             while node_stack:
                 node, parent_transform = node_stack.pop()
                 world = parent_transform @ np.array(node.transformation, dtype=np.float64).T
-                for mesh_idx in node.meshes:
-                    mesh_transforms[mesh_idx] = world
+                for mesh_ref in node.meshes:
+                    idx = mesh_ref if isinstance(mesh_ref, int) else mesh_ptr_to_idx.get(id(mesh_ref))
+                    if idx is not None:
+                        mesh_transforms[idx] = world
                 for child in node.children:
                     node_stack.append((child, world))
 
