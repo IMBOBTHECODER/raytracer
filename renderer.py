@@ -199,16 +199,6 @@ def random_unit_vec():
     return normalize(v)
 
 @ti.func
-def power_heuristic(pdf_a: ti.f32, pdf_b: ti.f32) -> ti.f32:
-    a2 = pdf_a * pdf_a
-    b2 = pdf_b * pdf_b
-    return a2 / (a2 + b2 + 1e-10)
-
-@ti.func
-def cosine_pdf(normal, scatter_dir) -> ti.f32:
-    return tm.max(0.0, tm.dot(normalize(scatter_dir), normal)) / tm.pi
-
-@ti.func
 def sphere_light_sample(sphere_idx, hit_point):
     """Sample a direction toward sphere light. Returns (dir, pdf); pdf=0 on degenerate."""
     center = sphere_center[sphere_idx]
@@ -241,18 +231,6 @@ def sphere_light_sample(sphere_idx, hit_point):
 
     return light_dir, pdf
 
-@ti.func
-def sphere_light_pdf(sphere_idx, from_point) -> ti.f32:
-    """Solid-angle PDF of the cone subtended by a sphere from from_point."""
-    center = sphere_center[sphere_idx]
-    radius = sphere_radius[sphere_idx]
-    dist2  = (center - from_point).norm_sqr()
-    pdf = 0.0
-    if dist2 > radius * radius:
-        cos_max = tm.sqrt(tm.max(0.0, 1.0 - radius * radius / dist2))
-        solid   = 2.0 * tm.pi * (1.0 - cos_max)
-        pdf     = 1.0 / solid
-    return pdf
 
 @ti.func
 def scatter(colour, material, metal_fuzz, refraction_index, ray_d, normal):
@@ -372,8 +350,7 @@ def scene_hit(ray_o, ray_d, t_min, t_max):
 def ray_colour(ray_o, ray_d):
     colour     = tm.vec3(0.0)
     throughput = tm.vec3(1.0)
-    prev_o     = ray_o   # scatter point from previous bounce (for MIS weight on emissive hits)
-    prev_bpdf  = -1.0    # BRDF pdf of previous scatter; -1 = camera ray or specular (skip MIS)
+    nee_done   = False  # skip emitter emission after diffuse bounces (NEE already sampled them)
 
     for depth in range(Config.depth_limit):
         t, hit_type, obj_idx, u, v = scene_hit(ray_o, ray_d, 0.001, 1e30)
@@ -430,31 +407,24 @@ def ray_colour(ray_o, ray_d):
 
         # ── Emissive / Absorbing ──────────────────────────────────────────────
         if mat_type == 3 or mat_type == 4:
-            if mat_type == 3:
-                if hit_type == 2 and prev_bpdf > 0.0:
-                    # Sphere emitter reached via BRDF: weight against its NEE counterpart
-                    lpdf = sphere_light_pdf(obj_idx, prev_o)
-                    w    = power_heuristic(prev_bpdf, lpdf)
-                    colour += throughput * mat_colour * mat_emit * w
-                else:
-                    # Triangle emitter, camera ray, or after specular — no NEE counterpart
-                    colour += throughput * mat_colour * mat_emit
+            if mat_type == 3 and not nee_done:
+                colour += throughput * mat_colour * mat_emit
             break
 
         # ── Direct light sampling (NEE) — diffuse surfaces only ──────────────
         if mat_type == 0:
+            diffuse_brdf = mat_colour / tm.pi
             for si in range(n_spheres):
                 if sphere_material[si] == 3:
                     light_dir, lpdf = sphere_light_sample(si, hit_point)
                     if lpdf > 0.0:
                         cos_t = tm.dot(light_dir, normal)
                         if cos_t > 0.0:
-                            sh_t, sh_type, sh_idx, _, _ = scene_hit(hit_point, light_dir, 0.001, 1e30)
-                            if sh_type == 2 and sh_idx == si:  # unoccluded path to light
-                                brdf_pdf = cos_t / tm.pi
-                                w        = power_heuristic(lpdf, brdf_pdf)
-                                colour  += throughput * (mat_colour / tm.pi) * cos_t \
-                                           * sphere_colour[si] * sphere_emission[si] * w / lpdf
+                            t_max = (sphere_center[si] - hit_point).norm() + sphere_radius[si]
+                            sh_t, sh_type, sh_idx, _, _ = scene_hit(hit_point, light_dir, 0.001, t_max)
+                            if sh_type == 2 and sh_idx == si:
+                                colour += throughput * diffuse_brdf * cos_t \
+                                          * sphere_colour[si] * sphere_emission[si] / lpdf
 
         # ── BRDF scatter ──────────────────────────────────────────────────────
         scatter_dir, attenuation, did_scatter = scatter(
@@ -464,13 +434,10 @@ def ray_colour(ray_o, ray_d):
         if not did_scatter:
             break
 
-        bpdf = cosine_pdf(normal, scatter_dir) if mat_type == 0 else -1.0
-
         throughput *= attenuation
-        prev_o    = hit_point
-        prev_bpdf = bpdf
-        ray_o     = hit_point
-        ray_d     = normalize(scatter_dir)
+        nee_done = (mat_type == 0)  # True after diffuse; specular resets to False
+        ray_o    = hit_point
+        ray_d    = normalize(scatter_dir)
 
     return colour
 
