@@ -389,26 +389,30 @@ class Mesh:
 
     @staticmethod
     def _load_blend(filepath, scale, translate):
-        import bpy, tempfile, os
-        print(f"[Mesh] Reading {filepath} via bpy...")
-        bpy.ops.wm.open_mainfile(filepath=os.path.abspath(filepath))
-        with tempfile.NamedTemporaryFile(suffix='.obj', delete=False) as f:
-            tmp_obj = f.name
-        try:
-            bpy.ops.wm.obj_export(filepath=tmp_obj, export_uv=True,
-                                  export_normals=True, export_materials=True)
-        except AttributeError:
-            # Blender < 3.2 fallback
-            bpy.ops.export_scene.obj(filepath=tmp_obj, use_uvs=True,
-                                     use_normals=True, use_materials=True)
-        try:
+        import subprocess, tempfile, os, shutil
+        blender = shutil.which("blender")
+        if blender is None:
+            raise RuntimeError("Blender not found. Install with: apt-get install -y blender")
+        print(f"[Mesh] Reading {filepath} via Blender subprocess...")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_obj = os.path.join(tmpdir, "export.obj")
+            script = (
+                "import bpy\n"
+                "bpy.ops.object.select_all(action='SELECT')\n"
+                "try:\n"
+                f"    bpy.ops.wm.obj_export(filepath={tmp_obj!r}, export_uv=True, export_normals=True, export_materials=True)\n"
+                "except Exception:\n"
+                f"    bpy.ops.export_scene.obj(filepath={tmp_obj!r}, use_uvs=True, use_normals=True, use_materials=True)\n"
+            )
+            script_path = os.path.join(tmpdir, "export.py")
+            with open(script_path, "w") as f:
+                f.write(script)
+            subprocess.run(
+                [blender, "--background", os.path.abspath(filepath), "--python", script_path],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
             vertices, faces, face_normals, normals, normal_faces, uvs, uv_faces, tex_paths = \
                 Mesh._load_obj(tmp_obj, scale, translate)
-        finally:
-            os.unlink(tmp_obj)
-            mtl = tmp_obj.replace('.obj', '.mtl')
-            if os.path.exists(mtl):
-                os.unlink(mtl)
         return vertices, faces, face_normals, normals, normal_faces, None, uvs, uv_faces, tex_paths
 
     @staticmethod
