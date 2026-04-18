@@ -10,7 +10,9 @@ if __name__ == "__main__":
     parser.add_argument("model", help="Path to .obj or .fbx file")
     parser.add_argument("--scale",     type=float, default=0.1)
     parser.add_argument("--colour",    type=float, nargs=3, default=[0.192, 0.549, 0.906], metavar=("R", "G", "B"))
-    parser.add_argument("--material",  type=str,   default=None, choices=[None, "metal", "glass", "emissive", "absorbing"])
+    parser.add_argument("--roughness",    type=float, default=1.0)
+    parser.add_argument("--metalness",    type=float, default=0.0)
+    parser.add_argument("--transmission", type=float, default=0.0)
     parser.add_argument("--translate", type=float, nargs=3, default=[0.0, -0.55, -2.0], metavar=("X", "Y", "Z"))
     parser.add_argument("--output",    type=str,   default="img/render",
                         help="Base path for output files")
@@ -54,7 +56,6 @@ if __name__ == "__main__":
         scene.add_object(mesh.Mesh(
             args.model,
             colour=np.array(args.colour),
-            material=args.material,
             scale=args.scale,
             translate=np.array(args.translate),
             ignore_fbx_materials=args.ignore_fbx_materials,

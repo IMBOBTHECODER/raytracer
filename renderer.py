@@ -257,27 +257,20 @@ def sphere_light_sample(sphere_idx, hit_point):
 
 
 @ti.func
-def scatter(colour, material, metal_fuzz, refraction_index, ray_d, normal):
+def scatter(colour, roughness, metalness, transmission, ray_d, normal):
     """Material BRDF — takes raw material values, works for any object type."""
     scatter_dir = tm.vec3(0.0)
     attenuation = colour
     did_scatter = False
 
-    if material == 1:  # Metal
-        d = normalize(ray_d)
-        reflected = d - 2 * tm.dot(d, normal) * normal
-        reflected += metal_fuzz * random_unit_vec()
-        did_scatter = tm.dot(reflected, normal) > 0
-        scatter_dir = reflected
+    r = ti.random()
 
-    elif material == 3 or material == 4:  # Emissive / Absorbing — ray terminates
-        did_scatter = False
-
-    elif material == 2:  # Glass
+    if r < transmission:  # Glass
+        ior = 1.5
         d = ray_d
         front_face = tm.dot(d, normal) < 0
         n = normal if front_face else -normal
-        eta = 1.0 / refraction_index if front_face else refraction_index
+        eta = 1.0 / ior if front_face else ior
         cos_theta = tm.min(tm.dot(-d, n), 1.0)
         sin_theta = tm.sqrt(tm.max(0.0, 1.0 - cos_theta ** 2))
         r0 = ((1 - eta) / (1 + eta)) ** 2
@@ -288,10 +281,17 @@ def scatter(colour, material, metal_fuzz, refraction_index, ray_d, normal):
             d_perp     = eta * (d + cos_theta * n)
             d_parallel = -tm.sqrt(ti.abs(1.0 - d_perp.norm_sqr())) * n
             scatter_dir = d_perp + d_parallel
-        attenuation = tm.vec3(1.0)  # glass doesn't tint
+        attenuation = colour
         did_scatter = True
 
-    else:  # Diffuse (material == 0)
+    elif r < transmission + metalness:  # Metal
+        d = normalize(ray_d)
+        reflected = d - 2 * tm.dot(d, normal) * normal
+        reflected += roughness * random_unit_vec()
+        did_scatter = tm.dot(reflected, normal) > 0
+        scatter_dir = reflected
+
+    else:  # Diffuse
         rand_vec = random_unit_vec()
         if tm.dot(rand_vec, normal) < 0:
             rand_vec = -rand_vec
@@ -399,11 +399,11 @@ def ray_colour(ray_o, ray_d):
                 normal = -normal
 
         # ── Material lookup ──────────────────────────────────────────────────
-        mat_colour = tm.vec3(0.0)
-        mat_type   = 0
-        mat_fuzz   = 0.0
-        mat_ior    = 1.5
-        mat_emit   = 0.0
+        mat_colour    = tm.vec3(0.0)
+        mat_roughness = 1.0
+        mat_metalness = 0.0
+        mat_trans     = 0.0
+        mat_emission  = tm.vec3(0.0)
 
         if hit_type == 0:  # triangle
             tid = tri_tex_id[obj_idx]
@@ -412,10 +412,10 @@ def ray_colour(ray_o, ray_d):
                 mat_colour = sample_texture(tid, uv)
             else:
                 mat_colour = tri_colour[obj_idx]
-            mat_type   = tri_material[obj_idx]
-            mat_fuzz   = tri_metal_fuzz[obj_idx]
-            mat_ior    = tri_refraction_index[obj_idx]
-            mat_emit   = tri_emission[obj_idx]
+            mat_roughness = tri_roughness[obj_idx]
+            mat_metalness = tri_metalness[obj_idx]
+            mat_trans     = tri_transmission[obj_idx]
+            mat_emission  = tri_emission[obj_idx]
         elif hit_type == 1:  # plane — checkerboard diffuse
             cx = int(hit_point[0]) if hit_point[0] >= 0 else int(hit_point[0]) - 1
             cz = int(hit_point[2]) if hit_point[2] >= 0 else int(hit_point[2]) - 1
@@ -423,25 +423,28 @@ def ray_colour(ray_o, ray_d):
                 mat_colour = tm.vec3(0.8, 0.8, 0.8)
             else:
                 mat_colour = tm.vec3(0.1, 0.1, 0.1)
-            mat_type = plane_material[obj_idx]
-            mat_fuzz = plane_metal_fuzz[obj_idx]
-            mat_ior  = plane_refraction_index[obj_idx]
-            mat_emit = plane_emission[obj_idx]
+            smat = plane_material[obj_idx]
+            mat_roughness = plane_metal_fuzz[obj_idx] if smat == 1 else 1.0
+            mat_metalness = 1.0 if smat == 1 else 0.0
+            mat_trans     = 1.0 if smat == 2 else 0.0
+            mat_emission  = mat_colour * plane_emission[obj_idx] if smat == 3 else tm.vec3(0.0)
         else:  # sphere
-            mat_colour = sphere_colour[obj_idx]
-            mat_type   = sphere_material[obj_idx]
-            mat_fuzz   = sphere_metal_fuzz[obj_idx]
-            mat_ior    = sphere_refraction_index[obj_idx]
-            mat_emit   = sphere_emission[obj_idx]
+            mat_colour    = sphere_colour[obj_idx]
+            smat          = sphere_material[obj_idx]
+            mat_roughness = sphere_metal_fuzz[obj_idx] if smat == 1 else 1.0
+            mat_metalness = 1.0 if smat == 1 else 0.0
+            mat_trans     = 1.0 if smat == 2 else 0.0
+            mat_emission  = mat_colour * sphere_emission[obj_idx] if smat == 3 else tm.vec3(0.0)
 
-        # ── Emissive / Absorbing ──────────────────────────────────────────────
-        if mat_type == 3 or mat_type == 4:
-            if mat_type == 3 and not nee_done:
-                colour += throughput * mat_colour * mat_emit
+        # ── Emissive — add and terminate ──────────────────────────────────────
+        if mat_emission.max() > 0.0:
+            if not nee_done:
+                colour += throughput * mat_emission
             break
 
-        # ── Direct light sampling (NEE) — diffuse surfaces only ──────────────
-        if mat_type == 0:
+        # ── Direct light sampling (NEE) — diffuse/metal surfaces ─────────────
+        is_diffuse = mat_metalness < 0.5 and mat_trans < 0.5
+        if is_diffuse:
             diffuse_brdf = mat_colour / tm.pi
             for si in range(n_spheres):
                 if sphere_material[si] == 3:
@@ -457,14 +460,14 @@ def ray_colour(ray_o, ray_d):
 
         # ── BRDF scatter ──────────────────────────────────────────────────────
         scatter_dir, attenuation, did_scatter = scatter(
-            mat_colour, mat_type, mat_fuzz, mat_ior, ray_d, normal
+            mat_colour, mat_roughness, mat_metalness, mat_trans, ray_d, normal
         )
 
         if not did_scatter:
             break
 
         throughput *= attenuation
-        nee_done = (mat_type == 0)  # True after diffuse; specular resets to False
+        nee_done = is_diffuse
         ray_o    = hit_point
         ray_d    = normalize(scatter_dir)
 
@@ -639,8 +642,8 @@ def _build_flat_bvh(v0_arr, v1_arr, v2_arr, leaf_size=8):
 
 
 def build(scene):
-    global tri_v0, tri_v1, tri_v2, tri_colour, tri_material
-    global tri_metal_fuzz, tri_refraction_index, tri_emission
+    global tri_v0, tri_v1, tri_v2, tri_colour
+    global tri_roughness, tri_metalness, tri_transmission, tri_emission
     global tri_normal, tri_n0, tri_n1, tri_n2, tri_has_smooth
     global tri_uv0, tri_uv1, tri_uv2, tri_tex_id
     global tex_atlas, n_textures
@@ -662,13 +665,13 @@ def build(scene):
     v1_np  = np.array([t.v1  for t in all_tris], dtype=np.float32)
     v2_np  = np.array([t.v2  for t in all_tris], dtype=np.float32)
 
-    colour_np   = np.array([t.colour.astype(np.float32)                       for t in all_tris], dtype=np.float32)
-    material_np = np.array([materials.get(t.material, 0)                      for t in all_tris], dtype=np.int32)
-    fuzz_np     = np.array([t.metal_fuzz                                       for t in all_tris], dtype=np.float32)
-    ior_np      = np.array([t.refraction_index                                 for t in all_tris], dtype=np.float32)
-    emission_np = np.array([t.emission_intensity                               for t in all_tris], dtype=np.float32)
-    normal_np   = np.array([t._normal.astype(np.float32)                      for t in all_tris], dtype=np.float32)
-    smooth_np   = np.array([1 if t.n0 is not None else 0                      for t in all_tris], dtype=np.int32)
+    colour_np       = np.array([t.colour.astype(np.float32)   for t in all_tris], dtype=np.float32)
+    roughness_np    = np.array([t.roughness                    for t in all_tris], dtype=np.float32)
+    metalness_np    = np.array([t.metalness                    for t in all_tris], dtype=np.float32)
+    transmission_np = np.array([t.transmission                 for t in all_tris], dtype=np.float32)
+    emission_np     = np.array([t.emission.astype(np.float32)  for t in all_tris], dtype=np.float32)
+    normal_np    = np.array([t._normal.astype(np.float32)                      for t in all_tris], dtype=np.float32)
+    smooth_np    = np.array([1 if t.n0 is not None else 0                      for t in all_tris], dtype=np.int32)
     n0_np = np.array([t.n0 if t.n0 is not None else t._normal for t in all_tris], dtype=np.float32)
     n1_np = np.array([t.n1 if t.n1 is not None else t._normal for t in all_tris], dtype=np.float32)
     n2_np = np.array([t.n2 if t.n2 is not None else t._normal for t in all_tris], dtype=np.float32)
@@ -715,10 +718,10 @@ def build(scene):
     tri_v1               = ti.Vector.field(3, dtype=ti.f32, shape=n)
     tri_v2               = ti.Vector.field(3, dtype=ti.f32, shape=n)
     tri_colour           = ti.Vector.field(3, dtype=ti.f32, shape=n)
-    tri_material         = ti.field(dtype=ti.i32, shape=n)
-    tri_metal_fuzz       = ti.field(dtype=ti.f32, shape=n)
-    tri_refraction_index = ti.field(dtype=ti.f32, shape=n)
-    tri_emission         = ti.field(dtype=ti.f32, shape=n)
+    tri_roughness        = ti.field(dtype=ti.f32, shape=n)
+    tri_metalness        = ti.field(dtype=ti.f32, shape=n)
+    tri_transmission     = ti.field(dtype=ti.f32, shape=n)
+    tri_emission         = ti.Vector.field(3, dtype=ti.f32, shape=n)
     tri_normal           = ti.Vector.field(3, dtype=ti.f32, shape=n)
     tri_n0               = ti.Vector.field(3, dtype=ti.f32, shape=n)
     tri_n1               = ti.Vector.field(3, dtype=ti.f32, shape=n)
@@ -752,9 +755,9 @@ def build(scene):
     tri_v1.from_numpy(v1_np)
     tri_v2.from_numpy(v2_np)
     tri_colour.from_numpy(colour_np)
-    tri_material.from_numpy(material_np)
-    tri_metal_fuzz.from_numpy(fuzz_np)
-    tri_refraction_index.from_numpy(ior_np)
+    tri_roughness.from_numpy(roughness_np)
+    tri_metalness.from_numpy(metalness_np)
+    tri_transmission.from_numpy(transmission_np)
     tri_emission.from_numpy(emission_np)
     tri_normal.from_numpy(normal_np)
     tri_has_smooth.from_numpy(smooth_np)

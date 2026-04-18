@@ -2,3 +2,4 @@ taichi
 numpy
 opencv-python
 pyassimp
+bpy

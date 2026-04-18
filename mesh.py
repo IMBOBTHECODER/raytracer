@@ -13,45 +13,49 @@ def _get_prop(props, name, default):
 
 def _map_material(mat):
     """
-    Convert a pyassimp material into the renderer's material system.
-    Returns (material_str, colour, metal_fuzz, refraction_index, emission_intensity).
+    Extract PBR properties from a pyassimp material.
+    Returns (base_colour, roughness, metalness, transmission, emission).
     """
     props = mat.properties
-    diffuse   = np.array(_get_prop(props, "diffuse",   [1, 1, 1]), dtype=np.float32).flatten()[:3]
-    emissive  = np.array(_get_prop(props, "emissive",  [0, 0, 0]), dtype=np.float32).flatten()[:3]
-    opacity   = float(np.array(_get_prop(props, "opacity",   1.0)).flat[0])
-    shininess = float(np.array(_get_prop(props, "shininess", 0.0)).flat[0])
+    base_colour  = np.array(_get_prop(props, "diffuse",                [1, 1, 1]), dtype=np.float32).flatten()[:3]
+    emissive     = np.array(_get_prop(props, "emissive",               [0, 0, 0]), dtype=np.float32).flatten()[:3]
+    opacity      = float(np.array(_get_prop(props, "opacity",          1.0)).flat[0])
+    shininess    = float(np.array(_get_prop(props, "shininess",        0.0)).flat[0])
+    metalness    = float(np.array(_get_prop(props, "$mat.metallicfactor",  0.0)).flat[0])
+    roughness    = float(np.array(_get_prop(props, "$mat.roughnessfactor", 1.0)).flat[0])
 
-    if float(emissive.max()) > 0.1:
-        material = "emissive"
-        emission = float(emissive.max())
-        return material, diffuse, 0.0, 1.0, emission
-    if opacity < 0.98:
-        return "glass", diffuse, 0.0, 1.5, 0.0
-    if shininess > 50:
-        fuzz = max(0.0, min(1.0, 1.0 - shininess / 100.0))
-        return "metal", diffuse, fuzz, 1.0, 0.0
-    return None, diffuse, 0.0, 1.0, 0.0  # diffuse
+    # Fallback: derive from legacy shininess if no PBR props present
+    if metalness == 0.0 and roughness == 1.0 and shininess > 0:
+        metalness = min(1.0, shininess / 200.0)
+        roughness = max(0.05, 1.0 - shininess / 128.0)
+
+    transmission = max(0.0, 1.0 - opacity)
+    emission_strength = float(emissive.max())
+    emission = (emissive * emission_strength).astype(np.float32) if emission_strength > 0 else np.zeros(3, dtype=np.float32)
+
+    return base_colour, roughness, metalness, transmission, emission
 
 
 class Triangle:
-    """A single triangle primitive. Stores geometry and material for GPU upload."""
+    """A single triangle primitive. Stores geometry and PBR material for GPU upload."""
     __slots__ = ('v0', 'v1', 'v2', '_normal', 'n0', 'n1', 'n2',
-                 'colour', 'material', 'metal_fuzz', 'emission_intensity', 'refraction_index',
+                 'colour', 'roughness', 'metalness', 'transmission', 'emission',
                  'uv0', 'uv1', 'uv2', 'tex_id')
 
     def __init__(self, v0, v1, v2, normal,
-                 colour, material, metal_fuzz, emission_intensity, refraction_index,
+                 colour, roughness=1.0, metalness=0.0, transmission=0.0,
+                 emission=None,
                  n0=None, n1=None, n2=None,
                  uv0=None, uv1=None, uv2=None, tex_id=-1):
         self.v0, self.v1, self.v2 = v0, v1, v2
         self._normal = normal
         self.n0, self.n1, self.n2 = n0, n1, n2
         self.colour = colour
-        self.material = material
-        self.metal_fuzz = metal_fuzz
-        self.emission_intensity = emission_intensity
-        self.refraction_index = refraction_index
+        self.roughness = float(roughness)
+        self.metalness = float(metalness)
+        self.transmission = float(transmission)
+        _z3 = np.zeros(3, dtype=np.float32)
+        self.emission = emission.astype(np.float32) if emission is not None else _z3
         _z2 = np.zeros(2, dtype=np.float32)
         self.uv0 = uv0 if uv0 is not None else _z2
         self.uv1 = uv1 if uv1 is not None else _z2
@@ -132,7 +136,7 @@ class BVHNode:
 
     @classmethod
     def build_parallel(cls, vertices, faces, face_normals, normals, normal_faces, num_workers,
-                       colour, material, metal_fuzz, emission_intensity, refraction_index,
+                       colour, roughness=1.0, metalness=0.0, transmission=0.0, emission=None,
                        face_mats=None, uvs=None, uv_faces=None, face_tex_ids=None):
         print(f"[BVH] Splitting {len(faces):,} triangles into {num_workers} chunks...")
 
@@ -161,7 +165,7 @@ class BVHNode:
              chunk(sorted_face_normals, i),
              normals,
              chunk(sorted_normal_faces, i)  if sorted_normal_faces  is not None else None,
-             colour, material, metal_fuzz, emission_intensity, refraction_index,
+             colour, roughness, metalness, transmission, emission,
              {k: chunk(v, i) for k, v in sorted_face_mats.items()} if sorted_face_mats is not None else None,
              uvs,
              chunk(sorted_uv_faces, i)     if sorted_uv_faces     is not None else None,
@@ -184,11 +188,12 @@ class BVHNode:
 
 
 def _build_bvh_subtree(args):
-    vertices, face_chunk, fn_chunk, normals, normal_face_chunk, colour, material, metal_fuzz, \
-    emission_intensity, refraction_index, face_mats, uvs, uv_face_chunk, face_tex_id_chunk = args
+    vertices, face_chunk, fn_chunk, normals, normal_face_chunk, colour, roughness, metalness, \
+    transmission, emission, face_mats, uvs, uv_face_chunk, face_tex_id_chunk = args
     n = len(face_chunk)
     triangles = [None] * n
     _z2 = np.zeros(2, dtype=np.float32)
+    _z3 = np.zeros(3, dtype=np.float32)
     for i in range(n):
         f  = face_chunk[i]
         n0 = n1 = n2 = None
@@ -197,13 +202,13 @@ def _build_bvh_subtree(args):
             if nf[0] >= 0 and nf[1] >= 0 and nf[2] >= 0:
                 n0, n1, n2 = normals[nf[0]], normals[nf[1]], normals[nf[2]]
         if face_mats is not None:
-            c  = face_mats['colour'][i]
-            m  = face_mats['material'][i]
-            fz = float(face_mats['fuzz'][i])
-            ir = float(face_mats['ior'][i])
-            em = float(face_mats['emission'][i])
+            c   = face_mats['colour'][i]
+            ro  = float(face_mats['roughness'][i])
+            me  = float(face_mats['metalness'][i])
+            tr  = float(face_mats['transmission'][i])
+            em  = face_mats['emission'][i]
         else:
-            c, m, fz, ir, em = colour, material, metal_fuzz, refraction_index, emission_intensity
+            c, ro, me, tr, em = colour, roughness, metalness, transmission, emission
         if uvs is not None and uv_face_chunk is not None:
             uf  = uv_face_chunk[i]
             uv0 = uvs[uf[0]].astype(np.float32) if uf[0] >= 0 else _z2
@@ -214,8 +219,7 @@ def _build_bvh_subtree(args):
         tex_id = int(face_tex_id_chunk[i]) if face_tex_id_chunk is not None else -1
         triangles[i] = Triangle(
             vertices[f[0]], vertices[f[1]], vertices[f[2]], fn_chunk[i],
-            colour=c, material=m, metal_fuzz=fz,
-            emission_intensity=em, refraction_index=ir,
+            colour=c, roughness=ro, metalness=me, transmission=tr, emission=em,
             n0=n0, n1=n1, n2=n2,
             uv0=uv0, uv1=uv1, uv2=uv2, tex_id=tex_id,
         )
@@ -223,12 +227,13 @@ def _build_bvh_subtree(args):
 
 
 class Mesh:
-    def __init__(self, filepath: str, colour: np.ndarray, material=None,
-                 metal_fuzz=0.0, emission_intensity=5.0, refraction_index=1.5,
+    def __init__(self, filepath: str, colour: np.ndarray,
+                 roughness=1.0, metalness=0.0, transmission=0.0, emission=None,
                  scale=1.0, translate=None, ignore_fbx_materials=False):
         import os, cv2
-        self.colour   = colour
-        self.material = material
+        self.colour = colour
+        _z3 = np.zeros(3, dtype=np.float32)
+        self.emission = emission if emission is not None else _z3
 
         vertices, faces, face_normals, normals, normal_faces, face_mats, uvs, uv_faces, tex_paths = \
             self._load_file(filepath, scale, np.zeros(3) if translate is None else translate)
@@ -262,8 +267,8 @@ class Mesh:
 
         self.bvh = BVHNode.build_parallel(
             vertices, faces, face_normals, normals, normal_faces, Config.num_workers,
-            colour=colour, material=material, metal_fuzz=metal_fuzz,
-            emission_intensity=emission_intensity, refraction_index=refraction_index,
+            colour=colour, roughness=roughness, metalness=metalness,
+            transmission=transmission, emission=self.emission,
             face_mats=None if ignore_fbx_materials else face_mats,
             uvs=uvs, uv_faces=uv_faces, face_tex_ids=face_tex_ids,
         )
@@ -378,7 +383,33 @@ class Mesh:
             vertices, faces, face_normals, normals, normal_faces, uvs, uv_faces, tex_paths = \
                 Mesh._load_obj(filepath, scale, translate)
             return vertices, faces, face_normals, normals, normal_faces, None, uvs, uv_faces, tex_paths
+        if ext == 'blend':
+            return Mesh._load_blend(filepath, scale, translate)
         return Mesh._load_assimp(filepath, scale, translate)
+
+    @staticmethod
+    def _load_blend(filepath, scale, translate):
+        import bpy, tempfile, os
+        print(f"[Mesh] Reading {filepath} via bpy...")
+        bpy.ops.wm.open_mainfile(filepath=os.path.abspath(filepath))
+        with tempfile.NamedTemporaryFile(suffix='.obj', delete=False) as f:
+            tmp_obj = f.name
+        try:
+            bpy.ops.wm.obj_export(filepath=tmp_obj, export_uv=True,
+                                  export_normals=True, export_materials=True)
+        except AttributeError:
+            # Blender < 3.2 fallback
+            bpy.ops.export_scene.obj(filepath=tmp_obj, use_uvs=True,
+                                     use_normals=True, use_materials=True)
+        try:
+            vertices, faces, face_normals, normals, normal_faces, uvs, uv_faces, tex_paths = \
+                Mesh._load_obj(tmp_obj, scale, translate)
+        finally:
+            os.unlink(tmp_obj)
+            mtl = tmp_obj.replace('.obj', '.mtl')
+            if os.path.exists(mtl):
+                os.unlink(mtl)
+        return vertices, faces, face_normals, normals, normal_faces, None, uvs, uv_faces, tex_paths
 
     @staticmethod
     def _load_assimp(filepath, scale, translate):
@@ -392,7 +423,7 @@ class Mesh:
         )
 
         all_verts, all_faces, all_norms, all_uvs = [], [], [], []
-        all_colours, all_materials, all_fuzz, all_ior, all_emission, all_tex_ids = [], [], [], [], [], []
+        all_colours, all_roughness, all_metalness, all_transmission, all_emission, all_tex_ids = [], [], [], [], [], []
         tex_paths = []
         path_to_id = {}
         vert_offset = 0
@@ -411,15 +442,29 @@ class Mesh:
                         path_to_id[val] = len(tex_paths)
                         tex_paths.append(val)
 
-            for m in scene.meshes:
-                verts   = np.array(m.vertices, dtype=np.float64)
+            # Build world transform per mesh by walking the node tree
+            mesh_transforms = [np.eye(4)] * len(scene.meshes)
+            node_stack = [(scene.rootnode, np.eye(4))]
+            while node_stack:
+                node, parent_transform = node_stack.pop()
+                world = parent_transform @ np.array(node.transformation, dtype=np.float64).T
+                for mesh_idx in node.meshes:
+                    mesh_transforms[mesh_idx] = world
+                for child in node.children:
+                    node_stack.append((child, world))
+
+            for mi, m in enumerate(scene.meshes):
+                T = mesh_transforms[mi]
+                verts_h = np.concatenate([m.vertices, np.ones((len(m.vertices), 1))], axis=1)
+                verts   = (verts_h @ T[:3, :].T).astype(np.float64)
+                R       = T[:3, :3]
+                norms   = (np.array(m.normals, dtype=np.float64) @ R.T)
                 faces_m = np.array(m.faces,    dtype=np.int32) + vert_offset
-                norms   = np.array(m.normals,  dtype=np.float64)
                 n_verts = len(verts)
                 n_faces = len(faces_m)
 
                 mat     = scene.materials[m.materialindex]
-                mat_str, colour, fuzz, ior, emission = _map_material(mat)
+                colour, roughness, metalness, transmission, emission = _map_material(mat)
 
                 # Per-vertex UVs (channel 0)
                 if m.texturecoords is not None and len(m.texturecoords) > 0 \
@@ -442,11 +487,11 @@ class Mesh:
                 all_faces.append(faces_m)
                 all_norms.append(norms)
                 all_uvs.append(uvs_m)
-                all_colours.append(np.tile(colour, (n_faces, 1)))
-                all_materials.append(np.full(n_faces, mat_str,   dtype=object))
-                all_fuzz.append(     np.full(n_faces, fuzz,      dtype=np.float64))
-                all_ior.append(      np.full(n_faces, ior,       dtype=np.float64))
-                all_emission.append( np.full(n_faces, emission,  dtype=np.float64))
+                all_colours.append(     np.tile(colour,    (n_faces, 1)).astype(np.float32))
+                all_roughness.append(   np.full(n_faces, roughness,    dtype=np.float32))
+                all_metalness.append(   np.full(n_faces, metalness,    dtype=np.float32))
+                all_transmission.append(np.full(n_faces, transmission, dtype=np.float32))
+                all_emission.append(    np.tile(emission, (n_faces, 1)).astype(np.float32))
                 all_tex_ids.append(  np.full(n_faces, tex_id_m,  dtype=np.int32))
                 vert_offset += n_verts
 
@@ -468,9 +513,9 @@ class Mesh:
 
         face_mats = {
             'colour':   np.concatenate(all_colours,   axis=0).astype(np.float64),
-            'material': np.concatenate(all_materials, axis=0),
-            'fuzz':     np.concatenate(all_fuzz,      axis=0),
-            'ior':      np.concatenate(all_ior,        axis=0),
+            'roughness': np.concatenate(all_roughness, axis=0),
+            'metalness':     np.concatenate(all_metalness,      axis=0),
+            'transmission':      np.concatenate(all_transmission,        axis=0),
             'emission': np.concatenate(all_emission,  axis=0),
             'tex_id':   np.concatenate(all_tex_ids,   axis=0),
         }
