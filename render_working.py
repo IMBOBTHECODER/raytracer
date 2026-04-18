@@ -64,7 +64,7 @@ if __name__ == "__main__":
             radius=2.0,
             colour=np.array([1.0, 0.95, 0.8]),
             material="emissive",
-            emission_intensity=12.0,
+            emission_intensity=3.0,
         ))
         renderer.build(scene)
         if args.bvh:
