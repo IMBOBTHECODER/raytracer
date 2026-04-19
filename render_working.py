@@ -62,7 +62,7 @@ if __name__ == "__main__":
         ))
         # Key light — front-right, above the car
         scene.add_object(objects.Sphere(
-            center=np.array([4.0, 4.0, 4.0]),
+            center=np.array([4.0, 5.0, 4.0]),
             radius=0.8,
             colour=np.array([1.0, 0.95, 0.85]),
             material="emissive",

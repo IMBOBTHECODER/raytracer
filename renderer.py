@@ -82,13 +82,15 @@ def apply_effect(linear: np.ndarray):
     """Apply bloom post-processing."""
     linear = linear.astype(np.float32)
 
-    # Bloom — only very bright highlights bleed
-    bright_hdr = np.clip(linear - 0.85, 0, None)
-    blur_tight = cv2.GaussianBlur(bright_hdr, (51,  51),  0)
-    blur_wide  = cv2.GaussianBlur(bright_hdr, (201, 201), 0)
-    blur_hdr   = (blur_tight * 0.4 + blur_wide * 0.5) * 0.35
-    # Cool/blue tint on the bloom glow
-    blur_hdr  *= np.array([0.6, 0.85, 1.4], dtype=np.float32)
+    # Bloom — cinematic glow on bright highlights
+    bright_hdr  = np.clip(linear - 0.6, 0, None)          # lower threshold = more surfaces glow
+    blur_tight  = cv2.GaussianBlur(bright_hdr, (51,  51),  0)
+    blur_mid    = cv2.GaussianBlur(bright_hdr, (101, 101), 0)
+    blur_wide   = cv2.GaussianBlur(bright_hdr, (251, 251), 0)
+    blur_hdr    = blur_tight * 0.3 + blur_mid * 0.4 + blur_wide * 0.6
+    blur_hdr   *= 0.7
+    # Warm orange-gold tint on bloom (cinematic key-light feel)
+    blur_hdr   *= np.array([1.2, 0.95, 0.6], dtype=np.float32)
     bloomed = linear + blur_hdr
 
     out = (np.clip(bloomed, 0, 1) * 255).astype(np.uint8)
