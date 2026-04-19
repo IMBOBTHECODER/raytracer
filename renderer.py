@@ -75,7 +75,11 @@ def normalize(v):
 
 @ti.func
 def background(direction):
-    return tm.vec3(0.0, 0.0, 0.0)
+    unit_direction = direction.normalized()
+    t = 0.5 * (unit_direction[1] + 1.0)
+    white = tm.vec3(1.0, 1.0, 1.0)
+    blue  = tm.vec3(0.5, 0.7, 1.0)
+    return (1.0 - t) * white + t * blue
 
 
 def apply_effect(linear: np.ndarray):
