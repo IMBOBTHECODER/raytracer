@@ -486,13 +486,17 @@ class Mesh:
                               f"width={etex.width}, height={etex.height})")
 
             # Build texture path list from all materials upfront
+            # sem 1 = aiTextureType_DIFFUSE (old Assimp), sem 12 = AI_TEXTURE_TYPE_BASE_COLOR (Assimp 5.x/GLTF)
+            if scene.materials:
+                print(f"[Mesh] DEBUG mat[0] properties: { {k: v for k, v in list(scene.materials[0].properties.items())[:20]} }")
             for mat in scene.materials:
                 for key, val in mat.properties.items():
                     name = key[0] if isinstance(key, tuple) else key
                     sem  = key[1] if isinstance(key, tuple) and len(key) > 1 else 0
-                    if '$tex.file' in name and sem == 1 and isinstance(val, str) and val not in path_to_id:
+                    if '$tex.file' in name and sem in (1, 12) and isinstance(val, str) and val not in path_to_id:
                         path_to_id[val] = len(tex_paths)
                         tex_paths.append(val)
+            print(f"[Mesh] DEBUG tex_paths={tex_paths}, tex_preloaded keys={list(tex_preloaded.keys())}")
 
             # Build world transform per mesh by walking the node tree
             mesh_ptr_to_idx = {id(m): i for i, m in enumerate(scene.meshes)}
@@ -534,7 +538,7 @@ class Mesh:
                 for key, val in mat.properties.items():
                     name = key[0] if isinstance(key, tuple) else key
                     sem  = key[1] if isinstance(key, tuple) and len(key) > 1 else 0
-                    if '$tex.file' in name and sem == 1 and isinstance(val, str):
+                    if '$tex.file' in name and sem in (1, 12) and isinstance(val, str):
                         tex_id_m = path_to_id.get(val, -1)
                         break
 
