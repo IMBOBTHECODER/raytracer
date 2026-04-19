@@ -61,11 +61,11 @@ if __name__ == "__main__":
             ignore_fbx_materials=args.ignore_fbx_materials,
         ))
         scene.add_object(objects.Sphere(
-            center=np.array([8.0, 10.0, 4.0]),
-            radius=2.0,
+            center=np.array([0.0, 6.0, -2.0]),
+            radius=1.5,
             colour=np.array([1.0, 0.95, 0.8]),
             material="emissive",
-            emission_intensity=3.0,
+            emission_intensity=8.0,
         ))
         renderer.build(scene)
         if args.bvh:

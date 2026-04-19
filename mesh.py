@@ -600,7 +600,10 @@ class Mesh:
 
     @staticmethod
     def _extract_gltf_textures(filepath):
-        """Extract embedded images from a GLB/GLTF file using pygltflib."""
+        """Extract embedded images from a GLB/GLTF file using pygltflib.
+        Keys are '*N' by TEXTURE index (matching Assimp's '*N' convention),
+        not image index — the two differ when textures reference images out of order.
+        """
         try:
             from pygltflib import GLTF2
         except ImportError:
@@ -610,9 +613,11 @@ class Mesh:
         result = {}
         try:
             gltf = GLTF2().load(filepath)
-            blob = gltf.binary_blob()  # raw bytes of the GLB binary chunk, or None
-            for i, image in enumerate(gltf.images):
-                key = f"*{i}"
+            blob = gltf.binary_blob()
+
+            # Load every image by its image index first
+            images_by_idx = {}
+            for i, image in enumerate(gltf.images or []):
                 try:
                     raw = None
                     if image.bufferView is not None and blob is not None:
@@ -624,9 +629,20 @@ class Mesh:
                         buf = np.frombuffer(raw, dtype=np.uint8)
                         img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
                         if img is not None:
-                            result[key] = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+                            images_by_idx[i] = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
                 except Exception as e:
-                    print(f"[Mesh] Warning: gltf texture *{i} failed: {e}")
+                    print(f"[Mesh] Warning: gltf image {i} failed: {e}")
+
+            # Key by TEXTURE index so '*N' matches what Assimp assigns to material tex paths
+            for i, texture in enumerate(gltf.textures or []):
+                src = getattr(texture, 'source', None)
+                if src is not None and src in images_by_idx:
+                    result[f"*{i}"] = images_by_idx[src]
+
+            # Fallback: if no textures array, key directly by image index
+            if not result:
+                result = {f"*{i}": img for i, img in images_by_idx.items()}
+
         except Exception as e:
             print(f"[Mesh] Warning: pygltflib load failed: {e}")
         return result
