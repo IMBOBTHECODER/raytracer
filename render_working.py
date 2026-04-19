@@ -60,12 +60,21 @@ if __name__ == "__main__":
             translate=np.array(args.translate),
             ignore_fbx_materials=args.ignore_fbx_materials,
         ))
+        # Key light — front-right, above the car
         scene.add_object(objects.Sphere(
-            center=np.array([0.0, 6.0, -2.0]),
-            radius=1.5,
-            colour=np.array([1.0, 0.95, 0.8]),
+            center=np.array([4.0, 4.0, 4.0]),
+            radius=0.8,
+            colour=np.array([1.0, 0.95, 0.85]),
             material="emissive",
-            emission_intensity=8.0,
+            emission_intensity=12.0,
+        ))
+        # Fill light — front-left, lower and softer
+        scene.add_object(objects.Sphere(
+            center=np.array([-4.0, 2.0, 3.0]),
+            radius=0.8,
+            colour=np.array([0.7, 0.8, 1.0]),
+            material="emissive",
+            emission_intensity=5.0,
         ))
         renderer.build(scene)
         if args.bvh:
