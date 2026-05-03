@@ -820,13 +820,7 @@ def render():
 
             framebuffer[j, i] += colour  # accumulate the colour for anti-aliasing
 
-        framebuffer[j, i] /= antialising_samples  # average the samples for anti-aliasingoint to focal point
-
-            colour = ray_colour(ray_o, ray_d)
-
-            framebuffer[j, i] += colour  # accumulate the colour for anti-aliasing
-
-        framebuffer[j, i] /= antialising_samples  # average the samples for anti-aliasing
+        framebuffer[j, i] /= antialising_samples  # average samples for anti-aliasing
 
 
 def _collect_obj_tris(obj):
