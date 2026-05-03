@@ -44,13 +44,13 @@ class Triangle:
     """A single triangle primitive. Stores geometry and PBR material for GPU upload."""
     __slots__ = ('v0', 'v1', 'v2', '_normal', 'n0', 'n1', 'n2',
                  'colour', 'roughness', 'metalness', 'transmission', 'emission',
-                 'uv0', 'uv1', 'uv2', 'tex_id')
+                 'uv0', 'uv1', 'uv2', 'tex_id', 'emis_tex_id')
 
     def __init__(self, v0, v1, v2, normal,
                  colour, roughness=1.0, metalness=0.0, transmission=0.0,
                  emission=None,
                  n0=None, n1=None, n2=None,
-                 uv0=None, uv1=None, uv2=None, tex_id=-1):
+                 uv0=None, uv1=None, uv2=None, tex_id=-1, emis_tex_id=-1):
         self.v0, self.v1, self.v2 = v0, v1, v2
         self._normal = normal
         self.n0, self.n1, self.n2 = n0, n1, n2
@@ -65,6 +65,7 @@ class Triangle:
         self.uv1 = uv1 if uv1 is not None else _z2
         self.uv2 = uv2 if uv2 is not None else _z2
         self.tex_id = tex_id
+        self.emis_tex_id = int(emis_tex_id)
 
 
 def _box_sa(bmin: np.ndarray, bmax: np.ndarray) -> float:
@@ -141,19 +142,21 @@ class BVHNode:
     @classmethod
     def build_parallel(cls, vertices, faces, face_normals, normals, normal_faces, num_workers,
                        colour, roughness=1.0, metalness=0.0, transmission=0.0, emission=None,
-                       face_mats=None, uvs=None, uv_faces=None, face_tex_ids=None):
+                       face_mats=None, uvs=None, uv_faces=None, face_tex_ids=None,
+                       face_emis_tex_ids=None):
         print(f"[BVH] Splitting {len(faces):,} triangles into {num_workers} chunks...")
 
         centroids = (vertices[faces[:, 0]] + vertices[faces[:, 1]] + vertices[faces[:, 2]]) / 3.0
         extents   = centroids.max(axis=0) - centroids.min(axis=0)
         axis      = int(np.argmax(extents))
         order     = np.argsort(centroids[:, axis])
-        sorted_faces        = faces[order]
-        sorted_face_normals = face_normals[order]
-        sorted_normal_faces = normal_faces[order]  if normal_faces  is not None else None
-        sorted_face_mats    = {k: v[order] for k, v in face_mats.items()} if face_mats is not None else None
-        sorted_uv_faces     = uv_faces[order]      if uv_faces      is not None else None
-        sorted_face_tex_ids = face_tex_ids[order]  if face_tex_ids  is not None else None
+        sorted_faces             = faces[order]
+        sorted_face_normals      = face_normals[order]
+        sorted_normal_faces      = normal_faces[order]      if normal_faces      is not None else None
+        sorted_face_mats         = {k: v[order] for k, v in face_mats.items()} if face_mats is not None else None
+        sorted_uv_faces          = uv_faces[order]          if uv_faces          is not None else None
+        sorted_face_tex_ids      = face_tex_ids[order]      if face_tex_ids      is not None else None
+        sorted_face_emis_tex_ids = face_emis_tex_ids[order] if face_emis_tex_ids is not None else None
 
         size = len(sorted_faces) // num_workers
         def chunk(arr, i):
@@ -168,12 +171,13 @@ class BVHNode:
              chunk(sorted_faces, i),
              chunk(sorted_face_normals, i),
              normals,
-             chunk(sorted_normal_faces, i)  if sorted_normal_faces  is not None else None,
+             chunk(sorted_normal_faces, i)       if sorted_normal_faces      is not None else None,
              colour, roughness, metalness, transmission, emission,
              {k: chunk(v, i) for k, v in sorted_face_mats.items()} if sorted_face_mats is not None else None,
              uvs,
-             chunk(sorted_uv_faces, i)     if sorted_uv_faces     is not None else None,
-             chunk(sorted_face_tex_ids, i) if sorted_face_tex_ids is not None else None)
+             chunk(sorted_uv_faces, i)           if sorted_uv_faces          is not None else None,
+             chunk(sorted_face_tex_ids, i)       if sorted_face_tex_ids      is not None else None,
+             chunk(sorted_face_emis_tex_ids, i)  if sorted_face_emis_tex_ids is not None else None)
             for i in range(num_workers)
         ]
 
@@ -193,7 +197,8 @@ class BVHNode:
 
 def _build_bvh_subtree(args):
     vertices, face_chunk, fn_chunk, normals, normal_face_chunk, colour, roughness, metalness, \
-    transmission, emission, face_mats, uvs, uv_face_chunk, face_tex_id_chunk = args
+    transmission, emission, face_mats, uvs, uv_face_chunk, face_tex_id_chunk, \
+    face_emis_tex_id_chunk = args
     n = len(face_chunk)
     triangles = [None] * n
     _z2 = np.zeros(2, dtype=np.float32)
@@ -220,12 +225,13 @@ def _build_bvh_subtree(args):
             uv2 = uvs[uf[2]].astype(np.float32) if uf[2] >= 0 else _z2
         else:
             uv0 = uv1 = uv2 = _z2
-        tex_id = int(face_tex_id_chunk[i]) if face_tex_id_chunk is not None else -1
+        tex_id      = int(face_tex_id_chunk[i])      if face_tex_id_chunk      is not None else -1
+        emis_tex_id = int(face_emis_tex_id_chunk[i]) if face_emis_tex_id_chunk is not None else -1
         triangles[i] = Triangle(
             vertices[f[0]], vertices[f[1]], vertices[f[2]], fn_chunk[i],
             colour=c, roughness=ro, metalness=me, transmission=tr, emission=em,
             n0=n0, n1=n1, n2=n2,
-            uv0=uv0, uv1=uv1, uv2=uv2, tex_id=tex_id,
+            uv0=uv0, uv1=uv1, uv2=uv2, tex_id=tex_id, emis_tex_id=emis_tex_id,
         )
     return BVHNode(triangles)
 
@@ -273,6 +279,15 @@ class Mesh:
         else:
             face_tex_ids = np.full(n_faces, -1, dtype=np.int32)
 
+        # Per-face emission texture IDs — same remapping
+        if face_mats is not None and 'emis_tex_id' in face_mats:
+            raw_emis_ids      = face_mats['emis_tex_id'].astype(np.int32)
+            face_emis_tex_ids = np.full(n_faces, -1, dtype=np.int32)
+            for old_id, new_id in tex_id_remap.items():
+                face_emis_tex_ids[raw_emis_ids == old_id] = new_id
+        else:
+            face_emis_tex_ids = np.full(n_faces, -1, dtype=np.int32)
+
         smooth = normal_faces is not None
         print(f"[Mesh] {filepath}: {len(faces):,} triangles ({'smooth' if smooth else 'flat'} normals), "
               f"{len([t for t in self.textures if t is not None])} texture(s)")
@@ -283,6 +298,7 @@ class Mesh:
             transmission=transmission, emission=self.emission,
             face_mats=None if ignore_fbx_materials else face_mats,
             uvs=uvs, uv_faces=uv_faces, face_tex_ids=face_tex_ids,
+            face_emis_tex_ids=face_emis_tex_ids,
         )
 
     @staticmethod
@@ -442,7 +458,7 @@ class Mesh:
         )
 
         all_verts, all_faces, all_norms, all_uvs = [], [], [], []
-        all_colours, all_roughness, all_metalness, all_transmission, all_emission, all_tex_ids = [], [], [], [], [], []
+        all_colours, all_roughness, all_metalness, all_transmission, all_emission, all_tex_ids, all_emis_tex_ids = [], [], [], [], [], [], []
         tex_paths = []
         tex_preloaded = {}
         path_to_id = {}
@@ -488,13 +504,14 @@ class Mesh:
 
             # Build texture path list from all materials upfront.
             # pyassimp key format varies: tuple ("$tex.file", sem, idx) in older versions,
-            # plain string "file" in newer versions. Accept both; sem 0/1/12 covers all cases.
+            # plain string "file" in newer versions.
+            # sem: 0/1/12 = diffuse/base-color, 4 = emissive (legacy), 14 = emission color (PBR)
             for mat in scene.materials:
                 for key, val in mat.properties.items():
                     name = key[0] if isinstance(key, tuple) else key
                     sem  = key[1] if isinstance(key, tuple) and len(key) > 1 else 0
                     is_tex = (name == 'file' or name.endswith('.file'))
-                    if is_tex and sem in (0, 1, 12) and isinstance(val, str) and val not in path_to_id:
+                    if is_tex and sem in (0, 1, 4, 12, 14) and isinstance(val, str) and val not in path_to_id:
                         path_to_id[val] = len(tex_paths)
                         tex_paths.append(val)
 
@@ -533,15 +550,24 @@ class Mesh:
                 else:
                     uvs_m = np.zeros((n_verts, 2), dtype=np.float64)
 
-                # Texture ID for this submesh's material
-                tex_id_m = -1
+                # Texture ID for this submesh's material (diffuse and emissive)
+                tex_id_m      = -1
+                emis_tex_id_m = -1
                 for key, val in mat.properties.items():
                     name = key[0] if isinstance(key, tuple) else key
                     sem  = key[1] if isinstance(key, tuple) and len(key) > 1 else 0
                     is_tex = (name == 'file' or name.endswith('.file'))
-                    if is_tex and sem in (0, 1, 12) and isinstance(val, str):
+                    if not is_tex or not isinstance(val, str):
+                        continue
+                    if sem in (0, 1, 12) and tex_id_m == -1:
                         tex_id_m = path_to_id.get(val, -1)
-                        break
+                    elif sem in (4, 14) and emis_tex_id_m == -1:
+                        emis_tex_id_m = path_to_id.get(val, -1)
+
+                # If an emission texture exists but the constant emissive is zero, promote to
+                # (1,1,1) so the kernel multiplication gives: 1 * texture = texture.
+                if emis_tex_id_m >= 0 and emission.max() == 0.0:
+                    emission = np.ones(3, dtype=np.float32)
 
                 # Vertex colours: use per-face average when available and material has no real colour
                 raw_faces = np.array(m.faces, dtype=np.int32)
@@ -557,11 +583,12 @@ class Mesh:
                 all_norms.append(norms)
                 all_uvs.append(uvs_m)
                 all_colours.append(face_col)
-                all_roughness.append(   np.full(n_faces, roughness,    dtype=np.float32))
-                all_metalness.append(   np.full(n_faces, metalness,    dtype=np.float32))
-                all_transmission.append(np.full(n_faces, transmission, dtype=np.float32))
-                all_emission.append(    np.tile(emission, (n_faces, 1)).astype(np.float32))
-                all_tex_ids.append(  np.full(n_faces, tex_id_m,  dtype=np.int32))
+                all_roughness.append(     np.full(n_faces, roughness,     dtype=np.float32))
+                all_metalness.append(     np.full(n_faces, metalness,     dtype=np.float32))
+                all_transmission.append(  np.full(n_faces, transmission,  dtype=np.float32))
+                all_emission.append(      np.tile(emission, (n_faces, 1)).astype(np.float32))
+                all_tex_ids.append(       np.full(n_faces, tex_id_m,      dtype=np.int32))
+                all_emis_tex_ids.append(  np.full(n_faces, emis_tex_id_m, dtype=np.int32))
                 vert_offset += n_verts
 
         vertices = np.concatenate(all_verts, axis=0) * scale + translate
@@ -581,12 +608,13 @@ class Mesh:
         face_normals = crosses / np.where(lens > 1e-12, lens, 1.0)
 
         face_mats = {
-            'colour':   np.concatenate(all_colours,   axis=0).astype(np.float64),
-            'roughness': np.concatenate(all_roughness, axis=0),
-            'metalness':     np.concatenate(all_metalness,      axis=0),
-            'transmission':      np.concatenate(all_transmission,        axis=0),
-            'emission': np.concatenate(all_emission,  axis=0),
-            'tex_id':   np.concatenate(all_tex_ids,   axis=0),
+            'colour':       np.concatenate(all_colours,      axis=0).astype(np.float64),
+            'roughness':    np.concatenate(all_roughness,    axis=0),
+            'metalness':    np.concatenate(all_metalness,    axis=0),
+            'transmission': np.concatenate(all_transmission, axis=0),
+            'emission':     np.concatenate(all_emission,     axis=0),
+            'tex_id':       np.concatenate(all_tex_ids,      axis=0),
+            'emis_tex_id':  np.concatenate(all_emis_tex_ids, axis=0),
         }
 
         # uv_faces == faces: assimp gives per-vertex UVs after JoinIdenticalVertices

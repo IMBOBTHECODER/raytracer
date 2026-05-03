@@ -25,6 +25,7 @@ tri_uv0          = None
 tri_uv1          = None
 tri_uv2          = None
 tri_tex_id       = None
+tri_emis_tex_id  = None
 
 tex_atlas  = None
 n_textures = 0
@@ -659,9 +660,9 @@ def ray_colour(ray_o, ray_d, sample_idx: ti.i32, pixel_seed: ti.u32):
         mat_emission  = tm.vec3(0.0)
 
         if hit_type == 0:  # triangle
+            uv = tri_uv0[obj_idx] * (1.0 - u - v) + tri_uv1[obj_idx] * u + tri_uv2[obj_idx] * v
             tid = tri_tex_id[obj_idx]
             if tid >= 0:
-                uv = tri_uv0[obj_idx] * (1.0 - u - v) + tri_uv1[obj_idx] * u + tri_uv2[obj_idx] * v
                 mat_colour = sample_texture(tid, uv)
             else:
                 mat_colour = tri_colour[obj_idx]
@@ -669,6 +670,9 @@ def ray_colour(ray_o, ray_d, sample_idx: ti.i32, pixel_seed: ti.u32):
             mat_metalness = tri_metalness[obj_idx]
             mat_trans     = tri_transmission[obj_idx]
             mat_emission  = tri_emission[obj_idx]
+            etid = tri_emis_tex_id[obj_idx]
+            if etid >= 0:
+                mat_emission = mat_emission * sample_texture(etid, uv)
         elif hit_type == 1:  # plane — checkerboard diffuse
             cx = int(hit_point[0]) if hit_point[0] >= 0 else int(hit_point[0]) - 1
             cz = int(hit_point[2]) if hit_point[2] >= 0 else int(hit_point[2]) - 1
@@ -749,7 +753,13 @@ def ray_colour(ray_o, ray_d, sample_idx: ti.i32, pixel_seed: ti.u32):
                     lpdf  = dist2 * tri_light_pdf_scale / (area * cos_l)
                     sh_t, sh_type, sh_idx, _, _ = scene_hit(hit_point, ldir, 0.001, dist * 0.9999)
                     if sh_type == -1:
-                        lem      = tri_emission[tidx]
+                        lem  = tri_emission[tidx]
+                        letid = tri_emis_tex_id[tidx]
+                        if letid >= 0:
+                            luv = ((1.0 - sqrt_lu1)          * tri_uv0[tidx]
+                                   + sqrt_lu1 * (1.0 - lu2)  * tri_uv1[tidx]
+                                   + sqrt_lu1 * lu2           * tri_uv2[tidx])
+                            lem = lem * sample_texture(letid, luv)
                         brdf_pdf = cos_s / tm.pi
                         w        = power_heuristic(lpdf, brdf_pdf)
                         colour  += throughput * w * diffuse_brdf * cos_s * lem / lpdf
@@ -949,11 +959,13 @@ def _build_flat_bvh(v0_arr, v1_arr, v2_arr, leaf_size=8):
     return bbox_min_arr, bbox_max_arr, left_arr, right_arr, tri_start_arr, tri_end_arr, np.array(ordered, dtype=np.int32)
 
 
-def _build_tri_lights(emission_np, v0_np, v1_np, v2_np):
+def _build_tri_lights(emission_np, v0_np, v1_np, v2_np, emis_tex_id_np=None):
     """Find emissive triangles, compute their areas, upload to GPU fields."""
     global tri_light_idx, tri_light_area, n_tri_lights, tri_light_pdf_scale
 
-    mask    = emission_np.max(axis=1) > 0
+    mask = emission_np.max(axis=1) > 0
+    if emis_tex_id_np is not None:
+        mask = mask | (emis_tex_id_np >= 0)
     indices = np.where(mask)[0].astype(np.int32)
 
     if len(indices) > 0:
@@ -978,7 +990,7 @@ def build(scene):
     global tri_v0, tri_v1, tri_v2, tri_colour
     global tri_roughness, tri_metalness, tri_transmission, tri_emission
     global tri_normal, tri_n0, tri_n1, tri_n2, tri_has_smooth
-    global tri_uv0, tri_uv1, tri_uv2, tri_tex_id
+    global tri_uv0, tri_uv1, tri_uv2, tri_tex_id, tri_emis_tex_id
     global tex_atlas, n_textures
     global bvh_bbox_min, bvh_bbox_max, bvh_left, bvh_right
     global bvh_tri_start, bvh_tri_end, bvh_tri_indices
@@ -1013,7 +1025,8 @@ def build(scene):
     uv0_np    = np.array([t.uv0    if hasattr(t, 'uv0') else _z2 for t in all_tris], dtype=np.float32)
     uv1_np    = np.array([t.uv1    if hasattr(t, 'uv1') else _z2 for t in all_tris], dtype=np.float32)
     uv2_np    = np.array([t.uv2    if hasattr(t, 'uv2') else _z2 for t in all_tris], dtype=np.float32)
-    tex_id_np = np.array([t.tex_id if hasattr(t, 'tex_id') else -1 for t in all_tris], dtype=np.int32)
+    tex_id_np      = np.array([t.tex_id      if hasattr(t, 'tex_id')      else -1 for t in all_tris], dtype=np.int32)
+    emis_tex_id_np = np.array([t.emis_tex_id if hasattr(t, 'emis_tex_id') else -1 for t in all_tris], dtype=np.int32)
 
     # ── Collect textures; remap per-mesh local tex_ids to global atlas ───────
     all_textures = []
@@ -1022,23 +1035,26 @@ def build(scene):
             all_textures.extend(obj.textures)
     n_textures = len(all_textures)
 
-    # Rebuild tex_id_np with global offsets by tracking which object each tri belongs to
+    # Rebuild tex_id_np and emis_tex_id_np with global offsets (both share the same atlas)
     global_offset = 0
-    tex_id_np_remapped = tex_id_np.copy()
+    tex_id_np_remapped      = tex_id_np.copy()
+    emis_tex_id_np_remapped = emis_tex_id_np.copy()
     i = 0
     for obj in scene.objects:
         if not hasattr(obj, 'bvh'):
             global_offset += len(getattr(obj, 'textures', []))
             continue
-        obj_tris = _collect_obj_tris(obj)
-        n_obj = len(obj_tris)
-        obj_offset = global_offset
-        if obj_offset > 0:
+        obj_tris  = _collect_obj_tris(obj)
+        n_obj     = len(obj_tris)
+        if global_offset > 0:
             mask = tex_id_np_remapped[i:i + n_obj] >= 0
-            tex_id_np_remapped[i:i + n_obj][mask] += obj_offset
+            tex_id_np_remapped[i:i + n_obj][mask] += global_offset
+            emask = emis_tex_id_np_remapped[i:i + n_obj] >= 0
+            emis_tex_id_np_remapped[i:i + n_obj][emask] += global_offset
         i += n_obj
         global_offset += len(getattr(obj, 'textures', []))
-    tex_id_np = tex_id_np_remapped
+    tex_id_np      = tex_id_np_remapped
+    emis_tex_id_np = emis_tex_id_np_remapped
 
     # ── Build flat BVH ───────────────────────────────────────────────────────
     print(f"[Build] Building BVH...")
@@ -1064,6 +1080,7 @@ def build(scene):
     tri_uv1              = ti.Vector.field(2, dtype=ti.f32, shape=n)
     tri_uv2              = ti.Vector.field(2, dtype=ti.f32, shape=n)
     tri_tex_id           = ti.field(dtype=ti.i32, shape=n)
+    tri_emis_tex_id      = ti.field(dtype=ti.i32, shape=n)
 
     # ── Allocate texture atlas ───────────────────────────────────────────────
     atlas_count = max(n_textures, 1)
@@ -1101,6 +1118,7 @@ def build(scene):
     tri_uv1.from_numpy(uv1_np)
     tri_uv2.from_numpy(uv2_np)
     tri_tex_id.from_numpy(tex_id_np)
+    tri_emis_tex_id.from_numpy(emis_tex_id_np)
 
     # ── Fill BVH fields (bulk upload via numpy) ──────────────────────────────
     bvh_bbox_min.from_numpy(bmin_np)
@@ -1111,7 +1129,7 @@ def build(scene):
     bvh_tri_end.from_numpy(te_np)
     bvh_tri_indices.from_numpy(tidx_np)
 
-    _build_tri_lights(emission_np, v0_np, v1_np, v2_np)
+    _build_tri_lights(emission_np, v0_np, v1_np, v2_np, emis_tex_id_np)
 
     # ── Planes ───────────────────────────────────────────────────────────────
     from objects import Plane, Sphere
@@ -1198,6 +1216,7 @@ def save_scene(path):
         tri_uv1          = tri_uv1.to_numpy(),
         tri_uv2          = tri_uv2.to_numpy(),
         tri_tex_id       = tri_tex_id.to_numpy(),
+        tri_emis_tex_id  = tri_emis_tex_id.to_numpy(),
         n_textures       = np.array(n_textures),
         tex_atlas        = tex_atlas.to_numpy(),
         # BVH
@@ -1235,7 +1254,7 @@ def load_scene(path):
     global tri_v0, tri_v1, tri_v2, tri_colour
     global tri_roughness, tri_metalness, tri_transmission, tri_emission
     global tri_normal, tri_n0, tri_n1, tri_n2, tri_has_smooth
-    global tri_uv0, tri_uv1, tri_uv2, tri_tex_id
+    global tri_uv0, tri_uv1, tri_uv2, tri_tex_id, tri_emis_tex_id
     global tex_atlas, n_textures
     global bvh_bbox_min, bvh_bbox_max, bvh_left, bvh_right
     global bvh_tri_start, bvh_tri_end, bvh_tri_indices
@@ -1265,6 +1284,7 @@ def load_scene(path):
     tri_uv1          = ti.Vector.field(2, dtype=ti.f32, shape=n)
     tri_uv2          = ti.Vector.field(2, dtype=ti.f32, shape=n)
     tri_tex_id       = ti.field(dtype=ti.i32, shape=n)
+    tri_emis_tex_id  = ti.field(dtype=ti.i32, shape=n)
 
     tri_v0.from_numpy(d['tri_v0'])
     tri_v1.from_numpy(d['tri_v1'])
@@ -1283,6 +1303,8 @@ def load_scene(path):
     tri_uv1.from_numpy(d['tri_uv1'])
     tri_uv2.from_numpy(d['tri_uv2'])
     tri_tex_id.from_numpy(d['tri_tex_id'])
+    emis_ids = d['tri_emis_tex_id'] if 'tri_emis_tex_id' in d else np.full(n, -1, dtype=np.int32)
+    tri_emis_tex_id.from_numpy(emis_ids)
 
     n_textures = int(d['n_textures'])
     atlas_data = d['tex_atlas']
@@ -1307,7 +1329,7 @@ def load_scene(path):
     bvh_tri_end.from_numpy(d['bvh_tri_end'])
     bvh_tri_indices.from_numpy(d['bvh_tri_indices'])
 
-    _build_tri_lights(d['tri_emission'], d['tri_v0'], d['tri_v1'], d['tri_v2'])
+    _build_tri_lights(d['tri_emission'], d['tri_v0'], d['tri_v1'], d['tri_v2'], emis_ids)
 
     n_planes = int(d['n_planes'])
     ns = max(n_planes, 1)
