@@ -128,14 +128,15 @@ def _build_sobol_dirs(max_dims: int, n_bits: int) -> np.ndarray:
             dirs[d, b] = dirs[(d - 1) % (len(_JK_INIT) + 1), b]
     return dirs
 
-def _owen_hash(x: np.uint32, seed: np.uint32) -> np.uint32:
-    x    = np.uint32(x)
-    seed = np.uint32(seed)
-    x ^= x    * np.uint32(0x3d20adea)
-    x += seed
-    x *= (seed >> np.uint32(2)) | np.uint32(1)
-    x ^= x    * np.uint32(0x05526c56)
-    x ^= x    * np.uint32(0x53a22864)
+def _owen_hash(x: int, seed: int) -> int:
+    M = 0xFFFFFFFF
+    x    = int(x)    & M
+    seed = int(seed) & M
+    x = (x ^ (x * 0x3d20adea)    & M) & M
+    x = (x +  seed)               & M
+    x = (x * ((seed >> 2) | 1))   & M
+    x = (x ^ (x * 0x05526c56)    & M) & M
+    x = (x ^ (x * 0x53a22864)    & M) & M
     return x
 
 def build_sobol_buffer(spp: int, n_dims: int, frame_seed: int = 0) -> np.ndarray:
@@ -1293,6 +1294,7 @@ def run():
     os.makedirs("hdr", exist_ok=True)
 
     print(f"[Render] Rendering {Config.img_width}x{Config.img_height}, {Config.antialising_samples} spp...")
+    init_sobol(Config.antialising_samples)
     _clear()
     t0 = time.time()
     render()

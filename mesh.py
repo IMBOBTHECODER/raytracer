@@ -35,8 +35,7 @@ def _map_material(mat):
         roughness = max(0.05, 1.0 - shininess / 128.0)
 
     transmission = max(0.0, 1.0 - opacity)
-    emission_strength = float(emissive.max())
-    emission = (emissive * emission_strength).astype(np.float32) if emission_strength > 0 else np.zeros(3, dtype=np.float32)
+    emission = emissive.astype(np.float32)
 
     return base_colour, roughness, metalness, transmission, emission
 

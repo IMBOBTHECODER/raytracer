@@ -28,8 +28,8 @@ class Config:
     # 5-10 samples (development), 50-100 samples (final)
     antialising_samples = 128 # number of rays to shoot per pixel for anti-aliasing
 
-    # 15 standard
-    depth_limit = 8 # maximum recursion depth for ray bounces (to prevent infinite recursion)
+    # 8 standard
+    depth_limit = 10 # maximum recursion depth for ray bounces (to prevent infinite recursion)
 
     save_path = "img/render_final.png"
     hdr_save_path = "hdr/render_final.npy"
