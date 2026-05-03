@@ -28,7 +28,7 @@ tri_tex_id       = None
 
 tex_atlas  = None
 n_textures = 0
-TEX_SIZE   = 4096
+TEX_SIZE   = 1024
 
 # BVH node fields (populated by build())
 bvh_bbox_min  = None  # vec3 per node — AABB min corner
@@ -62,9 +62,10 @@ sphere_emission         = None
 n_spheres = 0
 
 # Triangle area-light fields (populated by build() / load_scene())
-tri_light_idx  = None  # ti.field(i32) — indices into tri_* fields
-tri_light_area = None  # ti.field(f32) — precomputed triangle areas
-n_tri_lights   = 0
+tri_light_idx       = None  # ti.field(i32) — indices into tri_* fields
+tri_light_area      = None  # ti.field(f32) — precomputed triangle areas
+n_tri_lights        = 0
+tri_light_pdf_scale = 1.0   # = 1/n_tri_lights; pre-divided so the kernel never divides by 0
 
 framebuffer = ti.Vector.field(3, dtype=ti.f32, shape=(Config.img_height, Config.img_width))
 
@@ -701,7 +702,7 @@ def ray_colour(ray_o, ray_d, sample_idx: ti.i32, pixel_seed: ti.u32):
                             dist_sq = (hit_point - prev_hit_point).norm_sqr()
                             cos_l   = ti.abs(tm.dot(-ray_d, tri_normal[obj_idx]))
                             if cos_l > 1e-6:
-                                lpdf   = dist_sq / (n_tri_lights * tri_light_area[li] * cos_l)
+                                lpdf   = dist_sq * tri_light_pdf_scale / (tri_light_area[li] * cos_l)
                                 w_brdf = power_heuristic(prev_brdf_pdf, lpdf)
             colour += throughput * w_brdf * mat_emission
             break
@@ -745,7 +746,7 @@ def ray_colour(ray_o, ray_d, sample_idx: ti.i32, pixel_seed: ti.u32):
                 cos_l    = ti.abs(tm.dot(-ldir, tri_normal[tidx]))
                 if cos_s > 0.0 and cos_l > 1e-6:
                     area  = tri_light_area[li]
-                    lpdf  = dist2 / (n_tri_lights * area * cos_l)
+                    lpdf  = dist2 * tri_light_pdf_scale / (area * cos_l)
                     sh_t, sh_type, sh_idx, _, _ = scene_hit(hit_point, ldir, 0.001, dist * 0.9999)
                     if sh_type == -1:
                         lem      = tri_emission[tidx]
@@ -950,7 +951,7 @@ def _build_flat_bvh(v0_arr, v1_arr, v2_arr, leaf_size=8):
 
 def _build_tri_lights(emission_np, v0_np, v1_np, v2_np):
     """Find emissive triangles, compute their areas, upload to GPU fields."""
-    global tri_light_idx, tri_light_area, n_tri_lights
+    global tri_light_idx, tri_light_area, n_tri_lights, tri_light_pdf_scale
 
     mask    = emission_np.max(axis=1) > 0
     indices = np.where(mask)[0].astype(np.int32)
@@ -962,7 +963,8 @@ def _build_tri_lights(emission_np, v0_np, v1_np, v2_np):
         valid  = areas > 1e-10
         indices, areas = indices[valid], areas[valid]
 
-    n_tri_lights = len(indices)
+    n_tri_lights        = len(indices)
+    tri_light_pdf_scale = 1.0 / n_tri_lights if n_tri_lights > 0 else 1.0
     shape = max(n_tri_lights, 1)          # Taichi disallows shape=0
     tri_light_idx  = ti.field(dtype=ti.i32, shape=shape)
     tri_light_area = ti.field(dtype=ti.f32, shape=shape)
