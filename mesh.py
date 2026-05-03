@@ -5,11 +5,13 @@ import multiprocessing as mp
 
 def _get_prop(props, name, default):
     """Read a named property from a pyassimp material properties dict.
-    Matches both exact keys and keys ending in '.<name>' (e.g. '$clr.diffuse' for 'diffuse').
+    Matches: exact key, suffix match ('$clr.diffuse' for 'diffuse'),
+    or last-segment match ('metallicFactor' for '$mat.metallicfactor').
     """
+    last = name.split('.')[-1]  # e.g. 'metallicfactor' from '$mat.metallicfactor'
     for key_tuple, value in props.items():
         k = key_tuple[0].lower()
-        if k == name or k.endswith('.' + name):
+        if k == name or k == last or k.endswith('.' + name):
             return value
     return default
 

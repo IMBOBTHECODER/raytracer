@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Dashboard</title>
+
+        <style>
+            @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+
+            html, body {
+                font-family: 'Inter', sans-serif;
+                overflow: hidden;
+                display: flex;
+            }
+
+            #preview {
+                height: 100vh;
+                width: 50vw;
+                max-width: 500px;
+                padding: 10px;
+            }
+
+            #preview-image {
+                height: 100%;
+                width: 100%;
+            }
+
+            #controls {
+                padding: 10px;
+            }
+
+            .param-header {
+                border-bottom: 1px solid #ccc;
+                padding-bottom: 8px;
+                margin-bottom: 10px;
+            }
+        </style>
+    </head>
+    <body>
+        <div id="preview">
+            <img id="preview-image" src="https://picsum.photos/500/1000" alt="preview"> 
+        </div>
+        <div id="controls">
+            <h2 class="param-header">Parameters</h2>
+            <p>Lookfrom</p>
+            <p>Lookat</p>
+            <p>Anti-aliasing samples</p>
+            <p>Save path</p>
+        </div>
+    </body>
+</html>

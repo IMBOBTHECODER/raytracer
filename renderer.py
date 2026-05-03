@@ -1,3 +1,4 @@
+import os
 import pyassimp
 from config import Config
 import numpy as np
@@ -7,27 +8,27 @@ import taichi.math as tm
 
 ti.init(arch=ti.gpu)
 
-tri_v0              = None
-tri_v1              = None
-tri_v2              = None
-tri_colour          = None
-tri_material        = None
-tri_metal_fuzz      = None
-tri_refraction_index= None
-tri_emission        = None
-tri_normal          = None
-tri_n0              = None
-tri_n1              = None
-tri_n2              = None
-tri_has_smooth      = None
-tri_uv0             = None
-tri_uv1             = None
-tri_uv2             = None
-tri_tex_id          = None
+tri_v0           = None
+tri_v1           = None
+tri_v2           = None
+tri_colour       = None
+tri_roughness    = None
+tri_metalness    = None
+tri_transmission = None
+tri_emission     = None
+tri_normal       = None
+tri_n0           = None
+tri_n1           = None
+tri_n2           = None
+tri_has_smooth   = None
+tri_uv0          = None
+tri_uv1          = None
+tri_uv2          = None
+tri_tex_id       = None
 
 tex_atlas  = None
 n_textures = 0
-TEX_SIZE   = 512
+TEX_SIZE   = 4096
 
 # BVH node fields (populated by build())
 bvh_bbox_min  = None  # vec3 per node — AABB min corner
@@ -62,6 +63,228 @@ n_spheres = 0
 
 framebuffer = ti.Vector.field(3, dtype=ti.f32, shape=(Config.img_height, Config.img_width))
 
+# ── Owen-Scrambled Sobol ──────────────────────────────────────────────────────
+# Replaces ti.random() calls throughout. Dim layout per bounce (DIMS_PER_BOUNCE=5):
+#   base+0: material branch   (was `r` in scatter)
+#   base+1: scatter u
+#   base+2: scatter v
+#   base+3: NEE light sample u
+#   base+4: NEE light sample v
+# Plus 2 leading dims for depth-of-field (dims 0 and 1).
+# AA jitter reuses bounce-0 scatter dims — no conflict since those are consumed
+# before any surface is hit.
+DIMS_PER_BOUNCE = 5
+SOBOL_DIMS      = 2 + DIMS_PER_BOUNCE * Config.depth_limit
+SOBOL_BITS      = 32
+MAX_SOBOL_DIMS  = 64
+
+DIM_DOF_U       = 0
+DIM_DOF_V       = 1
+DIM_BOUNCE_BASE = 2   # bounce k uses dims DIM_BOUNCE_BASE + k*DIMS_PER_BOUNCE ..+4
+DIM_MAT         = 0   # offset within a bounce block
+DIM_SCATTER_U   = 1
+DIM_SCATTER_V   = 2
+DIM_LIGHT_U     = 3
+DIM_LIGHT_V     = 4
+
+# Joe & Kuo direction-number initialisers (first 10 non-trivial dims).
+# Full table: https://web.maths.unsw.edu.au/~fkuo/sobol/new-joe-kuo-6.21201
+_JK_INIT = [
+    (1, 0,  [1]),
+    (2, 1,  [1, 1]),
+    (3, 1,  [1, 1, 1]),
+    (3, 2,  [1, 1, 3]),
+    (4, 1,  [1, 1, 1, 3]),
+    (4, 4,  [1, 1, 3, 1]),
+    (5, 2,  [1, 1, 1, 1, 1]),
+    (5, 4,  [1, 1, 3, 5, 3]),
+    (5, 7,  [1, 1, 1, 5, 5]),
+    (5, 11, [1, 1, 3, 3, 1]),
+]
+
+def _build_sobol_dirs(max_dims: int, n_bits: int) -> np.ndarray:
+    dirs = np.zeros((max_dims, n_bits), dtype=np.uint32)
+    # Dim 0 — Van der Corput
+    for b in range(n_bits):
+        dirs[0, b] = np.uint32(1) << np.uint32(n_bits - 1 - b)
+    # Dims 1..len(_JK_INIT) — Joe & Kuo recurrence
+    for dim_idx, (s, a, m_init) in enumerate(_JK_INIT):
+        d = dim_idx + 1
+        if d >= max_dims:
+            break
+        v = np.zeros(n_bits + 1, dtype=np.uint64)
+        for i, mi in enumerate(m_init, start=1):
+            v[i] = np.uint64(mi) << np.uint64(n_bits - i)
+        for i in range(s + 1, n_bits + 1):
+            v[i] = v[i - s] ^ (v[i - s] >> np.uint64(s))
+            for k in range(1, s):
+                bit_k = (np.uint64(a) >> np.uint64(s - 1 - k)) & np.uint64(1)
+                v[i] ^= bit_k * v[i - k]
+        for b in range(n_bits):
+            dirs[d, b] = np.uint32(v[b + 1] & np.uint64(0xFFFFFFFF))
+    # Remaining dims — cycle through known ones
+    for d in range(len(_JK_INIT) + 1, max_dims):
+        for b in range(n_bits):
+            dirs[d, b] = dirs[(d - 1) % (len(_JK_INIT) + 1), b]
+    return dirs
+
+def _owen_hash(x: np.uint32, seed: np.uint32) -> np.uint32:
+    x    = np.uint32(x)
+    seed = np.uint32(seed)
+    x ^= x    * np.uint32(0x3d20adea)
+    x += seed
+    x *= (seed >> np.uint32(2)) | np.uint32(1)
+    x ^= x    * np.uint32(0x05526c56)
+    x ^= x    * np.uint32(0x53a22864)
+    return x
+
+def build_sobol_buffer(spp: int, n_dims: int, frame_seed: int = 0) -> np.ndarray:
+    """Build (spp, n_dims) Owen-scrambled Sobol buffer on CPU."""
+    dirs    = _build_sobol_dirs(MAX_SOBOL_DIMS, SOBOL_BITS)
+    indices = np.arange(spp, dtype=np.uint32)
+    buf     = np.empty((spp, n_dims), dtype=np.float32)
+    for dim in range(n_dims):
+        dim_seed = np.uint32(_owen_hash(np.uint32(dim), np.uint32(frame_seed)))
+        raw = np.zeros(spp, dtype=np.uint32)
+        for b in range(SOBOL_BITS):
+            mask = ((indices >> np.uint32(b)) & np.uint32(1)).astype(bool)
+            raw[mask] ^= dirs[dim % MAX_SOBOL_DIMS, b]
+        # Vectorised Owen hash (same ops as _owen_hash, applied elementwise)
+        x  = raw ^ (raw * np.uint32(0x3d20adea))
+        x  = x + dim_seed
+        x  = x * ((dim_seed >> np.uint32(2)) | np.uint32(1))
+        x  = x ^ (x  * np.uint32(0x05526c56))
+        x  = x ^ (x  * np.uint32(0x53a22864))
+        buf[:, dim] = x.astype(np.float64) / 4294967296.0
+    return buf
+
+# ── Blue Noise Pixel Seeds (void-and-cluster, Ulichney 1993) ─────────────────
+BN_TILE  = 64           # tile side length; 64×64 = 4096 unique rank values
+BN_CACHE = "bn_tile.npy"  # persisted across runs — generated once, reused forever
+
+
+def _bn_convolve(mask: np.ndarray, kernel_f: np.ndarray) -> np.ndarray:
+    """Toroidal Gaussian convolution using a pre-computed rfft2 kernel."""
+    return np.fft.irfft2(
+        np.fft.rfft2(mask.astype(np.float32)) * kernel_f,
+        s=mask.shape,
+    ).astype(np.float32)
+
+
+def generate_blue_noise_tile(size: int = BN_TILE, sigma: float = 1.5, seed: int = 0) -> np.ndarray:
+    """
+    Void-and-cluster blue noise.
+    Returns a (size, size) uint32 array of ranks in [0, size²).
+    Phases 2 and 3 each do size²//2 FFT convolutions on a size×size tile,
+    so size=64 finishes in well under a second.
+    """
+    rng = np.random.default_rng(seed)
+    N   = size * size
+
+    # Toroidal Gaussian kernel: wrap distances so the tile tiles seamlessly
+    r    = np.minimum(np.arange(size), size - np.arange(size)).astype(np.float32)
+    Y, X = np.meshgrid(r, r, indexing="ij")
+    kernel_f = np.fft.rfft2(np.exp(-(X ** 2 + Y ** 2) / (2.0 * sigma ** 2)))
+
+    # Initial binary pattern — exactly N//2 ones placed at random
+    flat = np.zeros(N, dtype=np.float32)
+    flat[: N // 2] = 1.0
+    rng.shuffle(flat)
+    mask = flat.reshape(size, size)
+
+    # Phase 1: swap highest-cluster 1 → lowest-void 0, repeat until stable.
+    # N//2 iterations is more than enough for a 64×64 tile.
+    for _ in range(N // 2):
+        e = _bn_convolve(mask, kernel_f).ravel()
+        m = mask.ravel()                          # view — writes propagate to mask
+        ones  = np.where(m > 0.5)[0]
+        voids = np.where(m < 0.5)[0]
+        hc = ones [np.argmax(e[ones ])]
+        lv = voids[np.argmin(e[voids])]
+        m[hc] = 0.0
+        m[lv] = 1.0
+
+    ranks = np.empty(N, dtype=np.uint32)
+    init  = mask.ravel().copy()                   # converged pattern, flat
+    n1    = int(init.sum())                        # number of ones after Phase 1
+
+    # Phase 2: assign ranks [n1-1 .. 0] by peeling off the highest-cluster 1
+    w = init.copy()
+    for rank in range(n1 - 1, -1, -1):
+        e   = _bn_convolve(w.reshape(size, size), kernel_f).ravel()
+        idx = np.where(w > 0.5)[0]
+        hc  = idx[np.argmax(e[idx])]
+        ranks[hc] = rank
+        w[hc] = 0.0
+
+    # Phase 3: assign ranks [n1 .. N-1] by filling the lowest-void 0
+    w = init.copy()
+    for rank in range(n1, N):
+        e   = _bn_convolve(w.reshape(size, size), kernel_f).ravel()
+        idx = np.where(w < 0.5)[0]
+        lv  = idx[np.argmin(e[idx])]
+        ranks[lv] = rank
+        w[lv] = 1.0
+
+    return ranks.reshape(size, size)
+
+
+def _load_or_gen_blue_noise() -> np.ndarray:
+    """Return a cached blue noise tile, or generate and cache it."""
+    if os.path.exists(BN_CACHE):
+        tile = np.load(BN_CACHE)
+        if tile.shape == (BN_TILE, BN_TILE):
+            return tile
+    print(f"[Sampler] Generating {BN_TILE}×{BN_TILE} blue noise tile (saved to {BN_CACHE})…")
+    tile = generate_blue_noise_tile(BN_TILE)
+    np.save(BN_CACHE, tile)
+    return tile
+
+
+# Populated by init_sobol() — call before render().
+sobol_buf   = None  # ti.field(f32, shape=(spp, SOBOL_DIMS))
+pixel_seeds = None  # ti.field(u32, shape=(H, W))
+
+def init_sobol(spp: int):
+    """Call once after scene setup, before the first render() call."""
+    global sobol_buf, pixel_seeds
+
+    buf_np = build_sobol_buffer(spp, SOBOL_DIMS)
+    sobol_buf = ti.field(dtype=ti.f32, shape=(spp, SOBOL_DIMS))
+    sobol_buf.from_numpy(buf_np)
+
+    # Blue noise pixel seeds: tile the rank map and map to full uint32 range.
+    # Neighboring pixels get well-separated scrambles → screen-space error is
+    # blue-noise distributed (perceptually nicer at low spp).
+    bn_tile  = _load_or_gen_blue_noise()
+    bn_u32   = (bn_tile.astype(np.float64)
+                * (np.float64(0xFFFFFFFF) / float(BN_TILE * BN_TILE - 1))
+               ).astype(np.uint32)
+    reps_h   = (Config.img_height + BN_TILE - 1) // BN_TILE
+    reps_w   = (Config.img_width  + BN_TILE - 1) // BN_TILE
+    seeds_np = np.tile(bn_u32, (reps_h, reps_w))[:Config.img_height, :Config.img_width].copy()
+    pixel_seeds = ti.field(dtype=ti.u32, shape=(Config.img_height, Config.img_width))
+    pixel_seeds.from_numpy(seeds_np)
+
+@ti.func
+def sobol(sample_idx: ti.i32, dim: ti.i32, pixel_seed: ti.u32) -> ti.f32:
+    """Fetch pre-built Sobol sample and apply a fast per-pixel Owen scramble."""
+    raw_u = ti.cast(sobol_buf[sample_idx, dim] * 4294967296.0, ti.u32)
+    h  = raw_u ^ pixel_seed
+    h ^= h >> 16
+    h *= ti.u32(0x85ebca6b)
+    h ^= h >> 13
+    h *= ti.u32(0xc2b2ae35)
+    h ^= h >> 16
+    return ti.cast(h, ti.f32) * ti.f32(2.3283064365386963e-10)  # / 2^32
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Everything below is identical to the original except:
+#   1. sphere_light_sample: two ti.random() → caller-supplied r1, r2 args
+#   2. scatter: three ti.random() → caller-supplied r, su1, su2 args
+#   3. ray_colour: new sample_idx + pixel_seed params; fetches sobol dims
+#   4. render: passes pseed + sample index; stratified jitter uses sobol
+# ─────────────────────────────────────────────────────────────────────────────
 
 @ti.func
 def lerp(a, b, t):
@@ -81,6 +304,11 @@ def background(direction):
     blue  = tm.vec3(0.5, 0.7, 1.0)
     return (1.0 - t) * white + t * blue
 
+@ti.func
+def power_heuristic(pdf_a, pdf_b):
+    a2 = pdf_a * pdf_a
+    b2 = pdf_b * pdf_b
+    return a2 / (a2 + b2)   # weight for sampler A
 
 def apply_effect(linear: np.ndarray):
     """Apply bloom post-processing."""
@@ -93,8 +321,8 @@ def apply_effect(linear: np.ndarray):
     blur_wide   = cv2.GaussianBlur(bright_hdr, (251, 251), 0)
     blur_hdr    = blur_tight * 0.3 + blur_mid * 0.4 + blur_wide * 0.6
     blur_hdr   *= 0.7
-    # Warm orange-gold tint on bloom (cinematic key-light feel)
-    blur_hdr   *= np.array([1.2, 0.95, 0.6], dtype=np.float32)
+    # Cool/blue tint on bloom
+    blur_hdr   *= np.array([0.8, 0.9, 1.2], dtype=np.float32)
     bloomed = linear + blur_hdr
 
     out = (np.clip(bloomed, 0, 1) * 255).astype(np.uint8)
@@ -192,23 +420,6 @@ def get_normal(tri_idx, ray_d, u, v):
     return n
 
 @ti.func
-def get_colour(tri_idx):
-    result = tm.vec3(0.0)
-    if tri_material[tri_idx] == 3:  # emissive
-        result = tri_colour[tri_idx] * tri_emission[tri_idx]
-    return result
-
-@ti.func
-def random_unit_vec():
-    # Random point on unit sphere via rejection — keep sampling until inside unit sphere
-    v = tm.vec3(0.0)
-    while True:
-        v = tm.vec3(ti.random() * 2 - 1, ti.random() * 2 - 1, ti.random() * 2 - 1)
-        if v.norm_sqr() <= 1.0:
-            break
-    return normalize(v)
-
-@ti.func
 def sample_texture(tex_id, uv):
     u  = uv[0] % 1.0
     v  = 1.0 - (uv[1] % 1.0)  # flip V: UV origin is bottom-left, image origin is top-left
@@ -225,8 +436,9 @@ def sample_texture(tex_id, uv):
     return (1.0-fx)*(1.0-fy)*c00 + fx*(1.0-fy)*c10 + (1.0-fx)*fy*c01 + fx*fy*c11
 
 @ti.func
-def sphere_light_sample(sphere_idx, hit_point):
-    """Sample a direction toward sphere light. Returns (dir, pdf); pdf=0 on degenerate."""
+def sphere_light_sample(sphere_idx, hit_point, r1: ti.f32, r2: ti.f32):
+    """Sample a direction toward sphere light. Returns (dir, pdf); pdf=0 on degenerate.
+    r1, r2 replace the two ti.random() calls that were inside this function."""
     center = sphere_center[sphere_idx]
     radius = sphere_radius[sphere_idx]
     to_center = center - hit_point
@@ -248,8 +460,6 @@ def sphere_light_sample(sphere_idx, hit_point):
         uu = normalize(tm.cross(up, w))
         vv = tm.cross(w, uu)
 
-        r1 = ti.random()
-        r2 = ti.random()
         cos_t = 1.0 - r1 * (1.0 - cos_max)
         sin_t = tm.sqrt(tm.max(0.0, 1.0 - cos_t * cos_t))
         phi   = 2.0 * tm.pi * r2
@@ -259,13 +469,33 @@ def sphere_light_sample(sphere_idx, hit_point):
 
 
 @ti.func
-def scatter(colour, roughness, metalness, transmission, ray_d, normal):
-    """Material BRDF — takes raw material values, works for any object type."""
+def sphere_light_pdf(sphere_idx, hit_point, direction):
+    """PDF of sampling `direction` toward sphere light (0 if direction misses the cone)."""
+    center = sphere_center[sphere_idx]
+    radius = sphere_radius[sphere_idx]
+    to_center = center - hit_point
+    dist2 = to_center.norm_sqr()
+    pdf = 0.0
+    if dist2 > radius * radius:
+        sin2_max = radius * radius / dist2
+        cos_max  = tm.sqrt(tm.max(0.0, 1.0 - sin2_max))
+        solid    = 2.0 * tm.pi * (1.0 - cos_max)
+        cos_dir  = tm.dot(direction, normalize(to_center))
+        if cos_dir > cos_max:
+            pdf = 1.0 / solid
+    return pdf
+
+
+@ti.func
+def scatter(colour, roughness, metalness, transmission, ray_d, normal,
+            r: ti.f32, su1: ti.f32, su2: ti.f32):
+    """Material BRDF — identical to original except the three ti.random() calls
+    are replaced by caller-supplied samples r, su1, su2."""
     scatter_dir = tm.vec3(0.0)
     attenuation = colour
     did_scatter = False
 
-    r = ti.random()
+    pdf = 0.0
 
     if r < transmission:  # Glass
         ior = 1.5
@@ -277,33 +507,45 @@ def scatter(colour, roughness, metalness, transmission, ray_d, normal):
         sin_theta = tm.sqrt(tm.max(0.0, 1.0 - cos_theta ** 2))
         r0 = ((1 - eta) / (1 + eta)) ** 2
         reflectance = r0 + (1 - r0) * (1 - cos_theta) ** 5
-        if eta * sin_theta > 1.0 or ti.random() < reflectance:
+        if eta * sin_theta > 1.0 or su1 < reflectance:  # su1 replaces the second ti.random()
             scatter_dir = d - 2 * tm.dot(d, n) * n
         else:
             d_perp     = eta * (d + cos_theta * n)
             d_parallel = -tm.sqrt(ti.abs(1.0 - d_perp.norm_sqr())) * n
             scatter_dir = d_perp + d_parallel
         attenuation = colour
+        pdf = 1.0
         did_scatter = True
 
-    elif r < transmission + metalness:  # Metal
+    elif r < transmission + metalness:  # Metal — uniform sphere fuzz via su1/su2
         d = normalize(ray_d)
         reflected = d - 2 * tm.dot(d, normal) * normal
-        reflected += roughness * random_unit_vec()
+        fuzz_phi   = 2.0 * tm.pi * su1
+        fuzz_cos_t = 1.0 - 2.0 * su2
+        fuzz_sin_t = tm.sqrt(tm.max(0.0, 1.0 - fuzz_cos_t * fuzz_cos_t))
+        reflected += roughness * tm.vec3(fuzz_sin_t * tm.cos(fuzz_phi),
+                                         fuzz_cos_t,
+                                         fuzz_sin_t * tm.sin(fuzz_phi))
         did_scatter = tm.dot(reflected, normal) > 0
+        pdf = 1.0
         scatter_dir = reflected
 
-    else:  # Diffuse
-        rand_vec = random_unit_vec()
-        if tm.dot(rand_vec, normal) < 0:
-            rand_vec = -rand_vec
-        scatter_direction = normal + rand_vec
-        if scatter_direction.norm() < 1e-8:
-            scatter_direction = normal
-        scatter_dir = scatter_direction
+    else:  # Diffuse — cosine-weighted hemisphere via su1/su2 (Malley's method)
+        diff_phi   = 2.0 * tm.pi * su1
+        diff_sin_t = tm.sqrt(su2)
+        diff_cos_t = tm.sqrt(1.0 - su2)
+        up = tm.vec3(0.0, 1.0, 0.0)
+        if ti.abs(normal[1]) > 0.9:
+            up = tm.vec3(1.0, 0.0, 0.0)
+        tangent   = normalize(tm.cross(up, normal))
+        bitangent = tm.cross(normal, tangent)
+        scatter_dir = (diff_sin_t * tm.cos(diff_phi) * tangent
+                       + diff_sin_t * tm.sin(diff_phi) * bitangent
+                       + diff_cos_t * normal)
+        pdf = diff_cos_t / tm.pi
         did_scatter = True
 
-    return scatter_dir, attenuation, did_scatter
+    return scatter_dir, attenuation, pdf, did_scatter
 
 
 @ti.func
@@ -373,12 +615,14 @@ def scene_hit(ray_o, ray_d, t_min, t_max):
 
 
 @ti.func
-def ray_colour(ray_o, ray_d):
+def ray_colour(ray_o, ray_d, sample_idx: ti.i32, pixel_seed: ti.u32):
     colour     = tm.vec3(0.0)
     throughput = tm.vec3(1.0)
-    nee_done   = False  # skip emitter emission after diffuse bounces (NEE already sampled them)
+    prev_hit_point = ray_o
+    prev_brdf_pdf  = 1.0
+    prev_specular  = True  # camera ray has no BRDF; treat like delta — always include emission
 
-    for depth in range(Config.depth_limit):
+    for bounce in range(Config.depth_limit):
         t, hit_type, obj_idx, u, v = scene_hit(ray_o, ray_d, 0.001, 1e30)
 
         if hit_type == -1:
@@ -438,41 +682,59 @@ def ray_colour(ray_o, ray_d):
             mat_trans     = 1.0 if smat == 2 else 0.0
             mat_emission  = mat_colour * sphere_emission[obj_idx] if smat == 3 else tm.vec3(0.0)
 
-        # ── Emissive — add and terminate ──────────────────────────────────────
+        # ── Emissive — MIS-weighted BRDF contribution ────────────────────────
         if mat_emission.max() > 0.0:
-            if not nee_done:
-                colour += throughput * mat_emission
+            w_brdf = 1.0
+            # MIS only applies when the previous bounce was diffuse AND this emitter has an NEE counterpart.
+            # Camera rays and specular/glass bounces always get full weight (no competing NEE strategy).
+            if not prev_specular and hit_type == 2:
+                lpdf = sphere_light_pdf(obj_idx, prev_hit_point, ray_d)
+                w_brdf = power_heuristic(prev_brdf_pdf, lpdf)
+            colour += throughput * w_brdf * mat_emission
             break
+
+        # ── Per-bounce Sobol dimension base ──────────────────────────────────
+        base = DIM_BOUNCE_BASE + bounce * DIMS_PER_BOUNCE
 
         # ── Direct light sampling (NEE) — diffuse/metal surfaces ─────────────
         is_diffuse = mat_metalness < 0.5 and mat_trans < 0.5
         if is_diffuse:
             diffuse_brdf = mat_colour / tm.pi
+            lu1 = sobol(sample_idx, base + DIM_LIGHT_U, pixel_seed)
+            lu2 = sobol(sample_idx, base + DIM_LIGHT_V, pixel_seed)
             for si in range(n_spheres):
                 if sphere_material[si] == 3:
-                    light_dir, lpdf = sphere_light_sample(si, hit_point)
+                    light_dir, lpdf = sphere_light_sample(si, hit_point, lu1, lu2)
                     if lpdf > 0.0:
                         cos_t = tm.dot(light_dir, normal)
                         if cos_t > 0.0:
                             t_max = (sphere_center[si] - hit_point).norm() + sphere_radius[si]
                             sh_t, sh_type, sh_idx, _, _ = scene_hit(hit_point, light_dir, 0.001, t_max)
                             if sh_type == 2 and sh_idx == si:
-                                colour += throughput * diffuse_brdf * cos_t \
-                                          * sphere_colour[si] * sphere_emission[si] / lpdf
+                                light_emission = sphere_colour[si] * sphere_emission[si]
+                                brdf_pdf_for_light_dir = cos_t / tm.pi
+                                w_light = power_heuristic(lpdf, brdf_pdf_for_light_dir)
+                                colour += throughput * w_light * diffuse_brdf * cos_t * light_emission / lpdf
 
         # ── BRDF scatter ──────────────────────────────────────────────────────
-        scatter_dir, attenuation, did_scatter = scatter(
-            mat_colour, mat_roughness, mat_metalness, mat_trans, ray_d, normal
+        r_mat = sobol(sample_idx, base + DIM_MAT,       pixel_seed)
+        su1   = sobol(sample_idx, base + DIM_SCATTER_U, pixel_seed)
+        su2   = sobol(sample_idx, base + DIM_SCATTER_V, pixel_seed)
+
+        scatter_dir, attenuation, brdf_pdf, did_scatter = scatter(
+            mat_colour, mat_roughness, mat_metalness, mat_trans, ray_d, normal,
+            r_mat, su1, su2
         )
 
         if not did_scatter:
             break
 
         throughput *= attenuation
-        nee_done = is_diffuse
-        ray_o    = hit_point
-        ray_d    = normalize(scatter_dir)
-
+        prev_hit_point = hit_point
+        prev_specular  = mat_metalness >= 0.5 or mat_trans >= 0.5
+        prev_brdf_pdf  = brdf_pdf
+        ray_o = hit_point
+        ray_d = normalize(scatter_dir)
     return colour
 
 
@@ -517,17 +779,20 @@ def render():
     use_stratified = sqrt_spp * sqrt_spp == antialising_samples
 
     for j, i in ti.ndrange(img_height, img_width):
+        pseed = pixel_seeds[j, i]
+
         for s in range(antialising_samples):
             sample_du = 0.0
             sample_dv = 0.0
             if use_stratified:
                 grid_c = s % sqrt_spp
                 grid_r = s // sqrt_spp
-                sample_du = (grid_c + ti.random()) / sqrt_spp - 0.5
-                sample_dv = (grid_r + ti.random()) / sqrt_spp - 0.5
+                # Sobol replaces ti.random() inside each stratum cell
+                sample_du = (grid_c + sobol(s, DIM_BOUNCE_BASE + DIM_SCATTER_U, pseed)) / sqrt_spp - 0.5
+                sample_dv = (grid_r + sobol(s, DIM_BOUNCE_BASE + DIM_SCATTER_V, pseed)) / sqrt_spp - 0.5
             else:
-                sample_du = ti.random() - 0.5
-                sample_dv = ti.random() - 0.5
+                sample_du = sobol(s, DIM_BOUNCE_BASE + DIM_SCATTER_U, pseed) - 0.5
+                sample_dv = sobol(s, DIM_BOUNCE_BASE + DIM_SCATTER_V, pseed) - 0.5
 
             du = i + sample_du
             dv = j + sample_dv
@@ -535,8 +800,11 @@ def render():
             # find the 3D center of this pixel on the viewport
             pixel_center = pixel00_loc + du * pixel_delta_u + dv * pixel_delta_v
 
-            angle  = ti.random() * 2.0 * tm.pi
-            radius = tm.sqrt(ti.random())
+            # DoF — Sobol replaces the two ti.random() calls
+            dof_u  = sobol(s, DIM_DOF_U, pseed)
+            dof_v  = sobol(s, DIM_DOF_V, pseed)
+            angle  = dof_u * 2.0 * tm.pi
+            radius = tm.sqrt(dof_v)
 
             offset = aperture * radius * (tm.cos(angle) * u + tm.sin(angle) * v)  # random point in aperture disk
 
@@ -547,6 +815,12 @@ def render():
             pixel_direction = normalize(pixel_center - camera_center)
             focal_point = camera_center + focus_dist * pixel_direction  # fixed point in space
             ray_d = normalize(focal_point - ray_o)  # ray from lens point to focal point
+
+            colour = ray_colour(ray_o, ray_d, s, pseed)
+
+            framebuffer[j, i] += colour  # accumulate the colour for anti-aliasing
+
+        framebuffer[j, i] /= antialising_samples  # average the samples for anti-aliasingoint to focal point
 
             colour = ray_colour(ray_o, ray_d)
 
