@@ -61,6 +61,11 @@ sphere_refraction_index = None
 sphere_emission         = None
 n_spheres = 0
 
+# Triangle area-light fields (populated by build() / load_scene())
+tri_light_idx  = None  # ti.field(i32) — indices into tri_* fields
+tri_light_area = None  # ti.field(f32) — precomputed triangle areas
+n_tri_lights   = 0
+
 framebuffer = ti.Vector.field(3, dtype=ti.f32, shape=(Config.img_height, Config.img_width))
 
 # ── Owen-Scrambled Sobol ──────────────────────────────────────────────────────
@@ -686,11 +691,18 @@ def ray_colour(ray_o, ray_d, sample_idx: ti.i32, pixel_seed: ti.u32):
         # ── Emissive — MIS-weighted BRDF contribution ────────────────────────
         if mat_emission.max() > 0.0:
             w_brdf = 1.0
-            # MIS only applies when the previous bounce was diffuse AND this emitter has an NEE counterpart.
-            # Camera rays and specular/glass bounces always get full weight (no competing NEE strategy).
-            if not prev_specular and hit_type == 2:
-                lpdf = sphere_light_pdf(obj_idx, prev_hit_point, ray_d)
-                w_brdf = power_heuristic(prev_brdf_pdf, lpdf)
+            if not prev_specular:
+                if hit_type == 2:  # sphere — NEE counterpart exists
+                    lpdf   = sphere_light_pdf(obj_idx, prev_hit_point, ray_d)
+                    w_brdf = power_heuristic(prev_brdf_pdf, lpdf)
+                elif hit_type == 0:  # triangle — find its solid-angle PDF for MIS
+                    for li in range(n_tri_lights):
+                        if tri_light_idx[li] == obj_idx:
+                            dist_sq = (hit_point - prev_hit_point).norm_sqr()
+                            cos_l   = ti.abs(tm.dot(-ray_d, tri_normal[obj_idx]))
+                            if cos_l > 1e-6:
+                                lpdf   = dist_sq / (n_tri_lights * tri_light_area[li] * cos_l)
+                                w_brdf = power_heuristic(prev_brdf_pdf, lpdf)
             colour += throughput * w_brdf * mat_emission
             break
 
@@ -716,6 +728,30 @@ def ray_colour(ray_o, ray_d, sample_idx: ti.i32, pixel_seed: ti.u32):
                                 brdf_pdf_for_light_dir = cos_t / tm.pi
                                 w_light = power_heuristic(lpdf, brdf_pdf_for_light_dir)
                                 colour += throughput * w_light * diffuse_brdf * cos_t * light_emission / lpdf
+
+            # ── Triangle area-light NEE ───────────────────────────────────────
+            for li in range(n_tri_lights):
+                tidx     = tri_light_idx[li]
+                lv0      = tri_v0[tidx];  lv1 = tri_v1[tidx];  lv2 = tri_v2[tidx]
+                sqrt_lu1 = tm.sqrt(lu1)
+                lp       = ((1.0 - sqrt_lu1) * lv0
+                            + sqrt_lu1 * (1.0 - lu2) * lv1
+                            + sqrt_lu1 * lu2           * lv2)
+                to_l     = lp - hit_point
+                dist2    = to_l.norm_sqr()
+                dist     = tm.sqrt(dist2)
+                ldir     = to_l / dist
+                cos_s    = tm.dot(ldir, normal)
+                cos_l    = ti.abs(tm.dot(-ldir, tri_normal[tidx]))
+                if cos_s > 0.0 and cos_l > 1e-6:
+                    area  = tri_light_area[li]
+                    lpdf  = dist2 / (n_tri_lights * area * cos_l)
+                    sh_t, sh_type, sh_idx, _, _ = scene_hit(hit_point, ldir, 0.001, dist * 0.9999)
+                    if sh_type == -1:
+                        lem      = tri_emission[tidx]
+                        brdf_pdf = cos_s / tm.pi
+                        w        = power_heuristic(lpdf, brdf_pdf)
+                        colour  += throughput * w * diffuse_brdf * cos_s * lem / lpdf
 
         # ── BRDF scatter ──────────────────────────────────────────────────────
         r_mat = sobol(sample_idx, base + DIM_MAT,       pixel_seed)
@@ -912,6 +948,30 @@ def _build_flat_bvh(v0_arr, v1_arr, v2_arr, leaf_size=8):
     return bbox_min_arr, bbox_max_arr, left_arr, right_arr, tri_start_arr, tri_end_arr, np.array(ordered, dtype=np.int32)
 
 
+def _build_tri_lights(emission_np, v0_np, v1_np, v2_np):
+    """Find emissive triangles, compute their areas, upload to GPU fields."""
+    global tri_light_idx, tri_light_area, n_tri_lights
+
+    mask    = emission_np.max(axis=1) > 0
+    indices = np.where(mask)[0].astype(np.int32)
+
+    if len(indices) > 0:
+        e1     = v1_np[indices] - v0_np[indices]
+        e2     = v2_np[indices] - v0_np[indices]
+        areas  = (0.5 * np.linalg.norm(np.cross(e1, e2), axis=1)).astype(np.float32)
+        valid  = areas > 1e-10
+        indices, areas = indices[valid], areas[valid]
+
+    n_tri_lights = len(indices)
+    shape = max(n_tri_lights, 1)          # Taichi disallows shape=0
+    tri_light_idx  = ti.field(dtype=ti.i32, shape=shape)
+    tri_light_area = ti.field(dtype=ti.f32, shape=shape)
+    if n_tri_lights > 0:
+        tri_light_idx.from_numpy(indices)
+        tri_light_area.from_numpy(areas)
+    print(f"[Build] {n_tri_lights} emissive triangle(s) registered for area-light NEE")
+
+
 def build(scene):
     global tri_v0, tri_v1, tri_v2, tri_colour
     global tri_roughness, tri_metalness, tri_transmission, tri_emission
@@ -1048,6 +1108,8 @@ def build(scene):
     bvh_tri_start.from_numpy(ts_np)
     bvh_tri_end.from_numpy(te_np)
     bvh_tri_indices.from_numpy(tidx_np)
+
+    _build_tri_lights(emission_np, v0_np, v1_np, v2_np)
 
     # ── Planes ───────────────────────────────────────────────────────────────
     from objects import Plane, Sphere
@@ -1242,6 +1304,8 @@ def load_scene(path):
     bvh_tri_start.from_numpy(d['bvh_tri_start'])
     bvh_tri_end.from_numpy(d['bvh_tri_end'])
     bvh_tri_indices.from_numpy(d['bvh_tri_indices'])
+
+    _build_tri_lights(d['tri_emission'], d['tri_v0'], d['tri_v1'], d['tri_v2'])
 
     n_planes = int(d['n_planes'])
     ns = max(n_planes, 1)
